@@ -110,6 +110,39 @@ need the pessimistic case. Reach for `sequence_string` when a column only needs
 to be unique and the right size, and you would rather spend the bytes
 elsewhere.
 
+### Where generation time goes
+
+Randomness is not the expensive part. Measured by replacing one generator at a
+time with a constant, 4M rows of `sample.spec` at four generator threads:
+
+| generator | fields | share of generation | per field |
+|---|---|---|---|
+| `datetime_around` | 3 | 33% | 963 ms |
+| `decimal_range` | 1 | 12% | 997 ms |
+| `sequence_string` | 3 | 9% | 257 ms |
+| `weighted_choice` | 3 | 5% | 145 ms |
+| `int_range` | 2 | 3% | 127 ms |
+
+`int_range` is the clean measurement of a random draw: `rng.gen_range` into an
+i64, no allocation, no formatting, about 32 ns per row. `StdRng` is ChaCha12 in
+userspace, not a syscall. Everything above it in that table is paying for text,
+not entropy.
+
+So timestamps and decimals do not become text on the way to Parquet. A
+generator emits `Value::Timestamp` (epoch microseconds) or `Value::Decimal`
+(unscaled units and a scale), and the Parquet writer takes the number. The
+strings are built only where something actually needs text: CSV output,
+`template` fields, and the JavaScript bridge. Formatting a timestamp so the
+writer could parse it straight back was costing more than the whole rest of the
+row: on the full Parquet pipeline the change took 4M rows from about 435k to
+about 1.09M rows/s.
+
+`datetime_around` also stopped reading the clock per row. It refreshes
+`Utc::now()` every few thousand rows and draws its offset in microseconds
+rather than seconds, which keeps the sub-second digits as varied as they were
+when every row called the clock. That matters more than it looks: a datetime
+column that quietly became compressible would change what a load test measures.
+
 ## Sizing and limits
 
 `--rows` is exact. `--target-size` is approximate, because a row's compressed

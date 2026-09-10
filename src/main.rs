@@ -30,6 +30,7 @@ use handlebars::{
     RenderError, RenderErrorReason,
 };
 use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng, SeedableRng};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -485,6 +486,18 @@ enum Value {
     I64(i64),
     F64(f64),
     String(String),
+    /// Microseconds since the Unix epoch, carrying the format the text paths
+    /// render it with. Keeping the number means the Parquet writer takes it
+    /// as-is; formatting a timestamp only to parse it straight back was the
+    /// single largest item in the generator profile.
+    ///
+    /// `skip` because `Value` is an untagged `Deserialize` used for literals
+    /// in a spec file: these two are produced by generators, never parsed.
+    #[serde(skip)]
+    Timestamp { micros: i64, format: Arc<str> },
+    /// Fixed point: `units` scaled by ten to the minus `scale`.
+    #[serde(skip)]
+    Decimal { units: i128, scale: u32 },
 }
 
 impl Value {
@@ -495,6 +508,8 @@ impl Value {
             Value::I64(value) => value.to_string(),
             Value::F64(value) => value.to_string(),
             Value::String(value) => value.clone(),
+            Value::Timestamp { micros, format } => format_timestamp_micros(*micros, format),
+            Value::Decimal { units, scale } => format_decimal_units(*units, *scale),
         }
     }
 
@@ -507,6 +522,12 @@ impl Value {
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),
             Value::String(value) => serde_json::Value::String(value.clone()),
+            Value::Timestamp { micros, format } => {
+                serde_json::Value::String(format_timestamp_micros(*micros, format))
+            }
+            Value::Decimal { units, scale } => {
+                serde_json::Value::String(format_decimal_units(*units, *scale))
+            }
         }
     }
 }
@@ -895,10 +916,14 @@ impl FieldGenerator for FloatRangeGenerator {
     }
 }
 
+/// Bounds are held as unscaled units at `scale`, converted once when the spec
+/// is compiled. Drawing an integer in those units avoids a round trip through
+/// f64 and `Decimal`, and avoids rendering a string the Parquet writer would
+/// only parse back.
 #[derive(Clone)]
 struct DecimalRangeGenerator {
-    min: Decimal,
-    max: Decimal,
+    min_units: i128,
+    max_units: i128,
     scale: u32,
     null_rate: Option<f64>,
 }
@@ -908,13 +933,15 @@ impl FieldGenerator for DecimalRangeGenerator {
         if should_emit_null(self.null_rate, rng)? {
             return Ok(Value::Null);
         }
-        ensure_decimal_range(self.min, self.max, "decimal_range")?;
-        let min = decimal_to_f64(self.min)?;
-        let max = decimal_to_f64(self.max)?;
-        let value = Decimal::from_f64_retain(rng.gen_range(min..=max))
-            .ok_or_else(|| anyhow!("failed to generate decimal"))?
-            .round_dp(self.scale);
-        Ok(Value::String(value.to_string()))
+        let units = if self.min_units == self.max_units {
+            self.min_units
+        } else {
+            rng.gen_range(self.min_units..=self.max_units)
+        };
+        Ok(Value::Decimal {
+            units,
+            scale: self.scale,
+        })
     }
 }
 
@@ -984,13 +1011,47 @@ impl FieldGenerator for FluctuatingGenerator {
     }
 }
 
+/// Rows between clock reads when the spec gives no explicit `base`. Offsets
+/// here span hours or days, so a base that trails real time by the few
+/// milliseconds it takes to emit this many rows is invisible in the data, and
+/// it removes a clock read per field per row.
+///
+/// Caching the clock would flatten the sub-second digits, which used to come
+/// from `Utc::now()` and gave the column most of its cardinality. The offset
+/// is drawn in microseconds rather than seconds to put that back, so the
+/// values stay as distinct as they were. That matters: a datetime column that
+/// suddenly compresses well would quietly change what a load test measures.
+const NOW_REFRESH_ROWS: u32 = 4096;
+
 #[derive(Clone)]
 struct DateTimeAroundGenerator {
     base: Option<DateTime<Utc>>,
-    offset_seconds_min: i64,
-    offset_seconds_max: i64,
-    format: String,
+    offset_micros_min: i64,
+    offset_micros_max: i64,
+    format: Arc<str>,
+    cached_now: Option<DateTime<Utc>>,
+    rows_until_refresh: u32,
     null_rate: Option<f64>,
+}
+
+impl DateTimeAroundGenerator {
+    fn base(&mut self) -> DateTime<Utc> {
+        if let Some(base) = self.base {
+            return base;
+        }
+        match self.cached_now {
+            Some(now) if self.rows_until_refresh > 0 => {
+                self.rows_until_refresh -= 1;
+                now
+            }
+            _ => {
+                let now = Utc::now();
+                self.cached_now = Some(now);
+                self.rows_until_refresh = NOW_REFRESH_ROWS;
+                now
+            }
+        }
+    }
 }
 
 impl FieldGenerator for DateTimeAroundGenerator {
@@ -998,27 +1059,23 @@ impl FieldGenerator for DateTimeAroundGenerator {
         if should_emit_null(self.null_rate, rng)? {
             return Ok(Value::Null);
         }
-        ensure_range(
-            self.offset_seconds_min,
-            self.offset_seconds_max,
-            "datetime offset",
-        )?;
-        let offset = if self.offset_seconds_min == self.offset_seconds_max {
-            self.offset_seconds_min
+        let offset = if self.offset_micros_min == self.offset_micros_max {
+            self.offset_micros_min
         } else {
-            rng.gen_range(self.offset_seconds_min..=self.offset_seconds_max)
+            rng.gen_range(self.offset_micros_min..=self.offset_micros_max)
         };
-        let base = self.base.unwrap_or_else(Utc::now);
-        let dt = base + chrono::Duration::seconds(offset);
-        Ok(Value::String(format_datetime(dt, &self.format)))
+        Ok(Value::Timestamp {
+            micros: self.base().timestamp_micros().saturating_add(offset),
+            format: self.format.clone(),
+        })
     }
 }
 
 #[derive(Clone)]
 struct DateTimeRangeGenerator {
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    format: String,
+    start_seconds: i64,
+    end_seconds: i64,
+    format: Arc<str>,
     null_rate: Option<f64>,
 }
 
@@ -1027,15 +1084,15 @@ impl FieldGenerator for DateTimeRangeGenerator {
         if should_emit_null(self.null_rate, rng)? {
             return Ok(Value::Null);
         }
-        let start = self.start.timestamp();
-        let end = self.end.timestamp();
-        ensure_range(start, end, "datetime_range")?;
-        let timestamp = rng.gen_range(start..=end);
-        let dt = Utc
-            .timestamp_opt(timestamp, 0)
-            .single()
-            .ok_or_else(|| anyhow!("invalid timestamp generated"))?;
-        Ok(Value::String(format_datetime(dt, &self.format)))
+        let seconds = if self.start_seconds == self.end_seconds {
+            self.start_seconds
+        } else {
+            rng.gen_range(self.start_seconds..=self.end_seconds)
+        };
+        Ok(Value::Timestamp {
+            micros: seconds.saturating_mul(1_000_000),
+            format: self.format.clone(),
+        })
     }
 }
 
@@ -2082,6 +2139,11 @@ impl FieldGenerator for JavaScriptGenerator {
                         Value::I64(n) => obj.set(key.as_str(), *n as f64)?,
                         Value::F64(f) => obj.set(key.as_str(), *f)?,
                         Value::String(s) => obj.set(key.as_str(), s.as_str())?,
+                        // JS has no decimal or timestamp type, so hand these
+                        // over as the text a template would have seen.
+                        Value::Timestamp { .. } | Value::Decimal { .. } => {
+                            obj.set(key.as_str(), val.csv_string("").as_str())?
+                        }
                     }
                 }
                 let result: rquickjs::Value = func.call((obj,))?;
@@ -2250,12 +2312,22 @@ fn compile_generator(spec: GeneratorSpec) -> Result<Generator> {
             precision: spec.precision,
             null_rate: spec.null_rate,
         }),
-        GeneratorSpec::DecimalRange(spec) => Generator::DecimalRange(DecimalRangeGenerator {
-            min: spec.min,
-            max: spec.max,
-            scale: spec.scale,
-            null_rate: spec.null_rate,
-        }),
+        GeneratorSpec::DecimalRange(spec) => {
+            ensure_decimal_range(spec.min, spec.max, "decimal_range")?;
+            if spec.scale > MAX_DECIMAL_SCALE {
+                bail!(
+                    "decimal_range scale {} is above the maximum of {}",
+                    spec.scale,
+                    MAX_DECIMAL_SCALE
+                );
+            }
+            Generator::DecimalRange(DecimalRangeGenerator {
+                min_units: decimal_to_units(spec.min, spec.scale, "decimal_range min")?,
+                max_units: decimal_to_units(spec.max, spec.scale, "decimal_range max")?,
+                scale: spec.scale,
+                null_rate: spec.null_rate,
+            })
+        }
         GeneratorSpec::Fluctuating(spec) => {
             ensure_decimal_range(spec.min, spec.max, "fluctuating")?;
             ensure_decimal_range(spec.step_min, spec.step_max, "fluctuating step")?;
@@ -2287,19 +2359,33 @@ fn compile_generator(spec: GeneratorSpec) -> Result<Generator> {
                 null_rate: spec.null_rate,
             })
         }
-        GeneratorSpec::DateTimeAround(spec) => Generator::DateTimeAround(DateTimeAroundGenerator {
-            base: spec.base.as_deref().map(parse_datetime).transpose()?,
-            offset_seconds_min: spec.offset_seconds_min,
-            offset_seconds_max: spec.offset_seconds_max,
-            format: spec.format,
-            null_rate: spec.null_rate,
-        }),
-        GeneratorSpec::DateTimeRange(spec) => Generator::DateTimeRange(DateTimeRangeGenerator {
-            start: parse_datetime(&spec.start)?,
-            end: parse_datetime(&spec.end)?,
-            format: spec.format,
-            null_rate: spec.null_rate,
-        }),
+        GeneratorSpec::DateTimeAround(spec) => {
+            ensure_range(
+                spec.offset_seconds_min,
+                spec.offset_seconds_max,
+                "datetime offset",
+            )?;
+            Generator::DateTimeAround(DateTimeAroundGenerator {
+                base: spec.base.as_deref().map(parse_datetime).transpose()?,
+                offset_micros_min: seconds_to_micros(spec.offset_seconds_min)?,
+                offset_micros_max: seconds_to_micros(spec.offset_seconds_max)?,
+                format: Arc::from(spec.format),
+                cached_now: None,
+                rows_until_refresh: 0,
+                null_rate: spec.null_rate,
+            })
+        }
+        GeneratorSpec::DateTimeRange(spec) => {
+            let start_seconds = parse_datetime(&spec.start)?.timestamp();
+            let end_seconds = parse_datetime(&spec.end)?.timestamp();
+            ensure_range(start_seconds, end_seconds, "datetime_range")?;
+            Generator::DateTimeRange(DateTimeRangeGenerator {
+                start_seconds,
+                end_seconds,
+                format: Arc::from(spec.format),
+                null_rate: spec.null_rate,
+            })
+        }
         GeneratorSpec::Choice(spec) => Generator::Choice(ChoiceGenerator {
             values: spec.values,
             null_rate: spec.null_rate,
@@ -2641,6 +2727,52 @@ fn parse_datetime(value: &str) -> Result<DateTime<Utc>> {
 
 fn format_datetime(dt: DateTime<Utc>, format: &str) -> String {
     dt.format(format).to_string()
+}
+
+/// Render epoch microseconds with a strftime pattern. Only the text outputs
+/// call this; the Parquet writer wants the number.
+fn format_timestamp_micros(micros: i64, format: &str) -> String {
+    match Utc.timestamp_micros(micros).single() {
+        Some(dt) => format_datetime(dt, format),
+        // Unreachable for values a generator produced, and a panic here would
+        // take down a writer thread over one row.
+        None => String::new(),
+    }
+}
+
+/// Render a fixed-point decimal without building a `Decimal` to do it.
+fn format_decimal_units(units: i128, scale: u32) -> String {
+    if scale == 0 {
+        return units.to_string();
+    }
+    let magnitude = units.unsigned_abs();
+    let divisor = 10u128.pow(scale);
+    format!(
+        "{}{}.{:0width$}",
+        if units < 0 { "-" } else { "" },
+        magnitude / divisor,
+        magnitude % divisor,
+        width = scale as usize
+    )
+}
+
+/// Convert a spec's decimal bound into unscaled units at `scale`, once, so the
+/// per-row path is an integer draw.
+fn decimal_to_units(value: Decimal, scale: u32, name: &str) -> Result<i128> {
+    let factor = Decimal::from_i128_with_scale(10i128.pow(scale), 0);
+    (value.round_dp(scale) * factor)
+        .round()
+        .to_i128()
+        .ok_or_else(|| anyhow!("{} bound {} does not fit a 128-bit decimal", name, value))
+}
+
+/// `rust_decimal` carries at most this many fractional digits.
+const MAX_DECIMAL_SCALE: u32 = 28;
+
+fn seconds_to_micros(seconds: i64) -> Result<i64> {
+    seconds
+        .checked_mul(1_000_000)
+        .ok_or_else(|| anyhow!("offset of {} seconds is too large to express in microseconds", seconds))
 }
 
 fn decimal_to_f64(value: Decimal) -> Result<f64> {
@@ -3229,14 +3361,99 @@ mod tests {
             .collect()
     }
 
-    fn compile_sequence_string(yaml: &str) -> Result<Generator> {
+    #[test]
+    fn renders_fixed_point_decimals() {
+        assert_eq!(format_decimal_units(4512, 2), "45.12");
+        assert_eq!(format_decimal_units(-4512, 2), "-45.12");
+        // The fraction is zero-padded, not trimmed.
+        assert_eq!(format_decimal_units(5, 2), "0.05");
+        assert_eq!(format_decimal_units(70000, 4), "7.0000");
+        assert_eq!(format_decimal_units(-5, 2), "-0.05");
+        assert_eq!(format_decimal_units(42, 0), "42");
+    }
+
+    #[test]
+    fn decimal_range_stays_in_bounds_at_the_declared_scale() {
+        let mut generator =
+            compile_gen("type: decimal_range\nmin: \"1.00\"\nmax: \"99.99\"\nscale: 2\n").unwrap();
+        for value in take_raw_values(&mut generator, 500) {
+            match value {
+                Value::Decimal { units, scale } => {
+                    assert_eq!(scale, 2);
+                    assert!((100..=9999).contains(&units), "out of range: {}", units);
+                }
+                other => panic!("expected a decimal, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_range_rejects_an_inverted_range() {
+        let error = compile_gen_err(
+            "type: decimal_range\nmin: \"9.00\"\nmax: \"1.00\"\nscale: 2\n",
+            "min above max",
+        );
+        assert!(error.to_string().contains("min must be"), "{}", error);
+    }
+
+    #[test]
+    fn datetime_around_keeps_the_configured_format() {
+        let mut generator = compile_gen(
+            "type: datetime_around\nbase: \"2020-06-15T12:00:00Z\"\noffset_seconds_min: 0\noffset_seconds_max: 0\nformat: \"%Y-%m-%d %H:%M:%S\"\n",
+        )
+        .unwrap();
+        let values = take_raw_values(&mut generator, 2);
+        assert!(matches!(values[0], Value::Timestamp { .. }));
+        assert_eq!(values[0].csv_string(""), "2020-06-15 12:00:00");
+    }
+
+    /// The cached clock must not leak between fields: an explicit base always
+    /// wins, and a generator without one still lands near now.
+    #[test]
+    fn datetime_around_without_a_base_tracks_the_clock() {
+        let mut generator = compile_gen(
+            "type: datetime_around\noffset_seconds_min: 0\noffset_seconds_max: 0\nformat: \"%Y-%m-%d %H:%M:%S\"\n",
+        )
+        .unwrap();
+        let before = Utc::now().timestamp_micros();
+        let values = take_raw_values(&mut generator, NOW_REFRESH_ROWS as usize + 10);
+        let after = Utc::now().timestamp_micros();
+        for value in values {
+            match value {
+                Value::Timestamp { micros, .. } => {
+                    assert!(micros >= before && micros <= after, "{} out of window", micros);
+                }
+                other => panic!("expected a timestamp, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn datetime_range_rejects_an_inverted_range() {
+        let error = compile_gen_err(
+            "type: datetime_range\nstart: \"2021-01-01T00:00:00Z\"\nend: \"2020-01-01T00:00:00Z\"\nformat: \"%Y-%m-%d\"\n",
+            "start after end",
+        );
+        assert!(error.to_string().contains("min must be"), "{}", error);
+    }
+
+    /// Pull `count` values out of one generator instance, untouched.
+    fn take_raw_values(generator: &mut Generator, count: usize) -> Vec<Value> {
+        let mut rng = StdRng::seed_from_u64(11);
+        let ctx = RowContext::new();
+        (0..count)
+            .map(|_| generator.generate(&ctx, &mut rng).unwrap())
+            .collect()
+    }
+
+    fn compile_gen(yaml: &str) -> Result<Generator> {
         let spec = serde_yaml::from_str::<GeneratorSpec>(yaml)?;
         compile_generator(spec)
     }
 
     /// `Generator` is not `Debug`, so `expect_err` is not available here.
-    fn compile_sequence_string_err(yaml: &str, why: &str) -> anyhow::Error {
-        match compile_sequence_string(yaml) {
+    fn compile_gen_err(yaml: &str, why: &str) -> anyhow::Error {
+        match compile_gen(yaml) {
             Ok(_) => panic!("expected a failure: {}", why),
             Err(error) => error,
         }
@@ -3244,7 +3461,7 @@ mod tests {
 
     #[test]
     fn sequence_string_pads_to_the_configured_width() {
-        let mut generator = compile_sequence_string("type: sequence_string\n").unwrap();
+        let mut generator = compile_gen("type: sequence_string\n").unwrap();
         let values = take_values(&mut generator, 3);
         assert_eq!(values[0].len(), 36, "{}", values[0]);
         assert_eq!(values[0], "0".repeat(35) + "1");
@@ -3253,7 +3470,7 @@ mod tests {
 
     #[test]
     fn sequence_string_fills_a_template_to_uuid_shape() {
-        let mut generator = compile_sequence_string(
+        let mut generator = compile_gen(
             "type: sequence_string\ntemplate: \"00000000-0000-4000-8000-{}\"\n",
         )
         .unwrap();
@@ -3266,7 +3483,7 @@ mod tests {
     #[test]
     fn sequence_string_honours_start_and_step() {
         let mut generator =
-            compile_sequence_string("type: sequence_string\nstart: 10\nstep: 5\nwidth: 4\n")
+            compile_gen("type: sequence_string\nstart: 10\nstep: 5\nwidth: 4\n")
                 .unwrap();
         assert_eq!(take_values(&mut generator, 3), vec!["0010", "0015", "0020"]);
     }
@@ -3275,7 +3492,7 @@ mod tests {
     /// get, and a key column cannot afford them repeating each other.
     #[test]
     fn sequence_string_clones_do_not_collide() {
-        let generator = compile_sequence_string("type: sequence_string\n").unwrap();
+        let generator = compile_gen("type: sequence_string\n").unwrap();
         let mut first = generator.clone();
         let mut second = generator.clone();
         // More than one block each, so the refill path is covered too.
@@ -3289,13 +3506,13 @@ mod tests {
 
     #[test]
     fn sequence_string_rejects_a_template_that_does_not_fit() {
-        let too_wide = compile_sequence_string_err(
+        let too_wide = compile_gen_err(
             "type: sequence_string\ntemplate: \"invoice-{}\"\nwidth: 4\n",
             "literal text is wider than the width",
         );
         assert!(too_wide.to_string().contains("does not fit"), "{}", too_wide);
 
-        let no_placeholder = compile_sequence_string_err(
+        let no_placeholder = compile_gen_err(
             "type: sequence_string\ntemplate: \"invoice\"\n",
             "no placeholder",
         );
@@ -3490,19 +3707,19 @@ fields:
             matches!(row.get("float_range_field"), Some(Value::F64(value)) if *value >= 1.0 && *value <= 3.0)
         );
         assert!(
-            matches!(row.get("decimal_range_field"), Some(Value::String(value)) if !value.is_empty())
+            matches!(row.get("decimal_range_field"), Some(value @ Value::Decimal { .. }) if !value.csv_string("").is_empty())
         );
         assert!(
             matches!(row.get("fluctuating_field"), Some(Value::I64(value)) if *value >= 1 && *value <= 100)
         );
         assert!(
-            matches!(row.get("datetime_around_now_field"), Some(Value::String(value)) if value.len() == 4)
+            matches!(row.get("datetime_around_now_field"), Some(value @ Value::Timestamp { .. }) if value.csv_string("").len() == 4)
         );
         assert!(
-            matches!(row.get("datetime_around_field"), Some(Value::String(value)) if value == "2020-01-01")
+            matches!(row.get("datetime_around_field"), Some(value @ Value::Timestamp { .. }) if value.csv_string("") == "2020-01-01")
         );
         assert!(
-            matches!(row.get("datetime_range_field"), Some(Value::String(value)) if value == "2020-01-01")
+            matches!(row.get("datetime_range_field"), Some(value @ Value::Timestamp { .. }) if value.csv_string("") == "2020-01-01")
         );
         assert!(
             matches!(row.get("choice_field"), Some(Value::String(value)) if value == "red" || value == "blue")

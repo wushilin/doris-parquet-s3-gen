@@ -486,6 +486,107 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The typed `Value::Timestamp` / `Value::Decimal` path skips the format
+    /// and reparse the text path does, so it needs its own round trip: write
+    /// typed values, read the Parquet back, and check the numbers landed.
+    #[tokio::test]
+    async fn typed_timestamps_and_decimals_survive_the_round_trip() {
+        use arrow::array::{Decimal128Array, TimestampMicrosecondArray};
+
+        let dir = std::env::temp_dir().join(format!("dpsg-typed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let destination = Destination::Local { directory: dir.clone() };
+        let (store, prefix) = build_store(&destination).expect("store");
+
+        let tables = parse_schema(
+            "CREATE TABLE t (id BIGINT NOT NULL, amount DECIMAL(19,4), ts DATETIME(6)) ENGINE=OLAP",
+        )
+        .unwrap();
+        let mut builder = BatchBuilder::new(tables[0].columns.clone(), 256).unwrap();
+        let stats = Arc::new(Stats::default());
+        let mut sink = ParquetSink::new(
+            store,
+            prefix,
+            0,
+            settings(builder.schema(), None),
+            stats.clone(),
+        );
+
+        let format: Arc<str> = Arc::from("%Y-%m-%d %H:%M:%S%.6f");
+        // Scale 2 into a scale-4 column, so the rescale path is exercised too.
+        let expected: Vec<(i64, i128, i64)> = (0..500i64)
+            .map(|index| {
+                let units = (index % 9000) + 100; // 1.00 .. 91.99 at scale 2
+                let micros = 1_757_500_000_000_000 + index * 1_000_037;
+                (index, units as i128, micros)
+            })
+            .collect();
+
+        for (index, units, micros) in &expected {
+            let row: Vec<(String, Value)> = vec![
+                ("id".into(), Value::I64(*index)),
+                (
+                    "amount".into(),
+                    Value::Decimal {
+                        units: *units,
+                        scale: 2,
+                    },
+                ),
+                (
+                    "ts".into(),
+                    Value::Timestamp {
+                        micros: *micros,
+                        format: format.clone(),
+                    },
+                ),
+            ];
+            builder
+                .append_row(|name| row.iter().find(|(key, _)| key == name).map(|(_, v)| v))
+                .unwrap();
+        }
+        let batch = builder.finish().unwrap();
+        sink.write(batch).await.expect("write batch");
+        sink.finish().await.expect("finish");
+
+        let written: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+            .collect();
+        assert_eq!(written.len(), 1);
+
+        let file = std::fs::File::open(written[0].path()).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut seen = 0usize;
+        for batch in reader {
+            let batch = batch.unwrap();
+            let amounts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal column");
+            let stamps = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("timestamp column");
+            for row in 0..batch.num_rows() {
+                let (_, units, micros) = expected[seen];
+                // Scale 2 stored into a scale-4 column is x100.
+                assert_eq!(amounts.value(row), units * 100, "amount at row {}", seen);
+                assert_eq!(stamps.value(row), micros, "timestamp at row {}", seen);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, expected.len());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn rolls_to_a_new_file_at_the_size_cap() {
         let dir = std::env::temp_dir().join(format!("dpsg-roll-{}", std::process::id()));

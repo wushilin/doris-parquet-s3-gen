@@ -170,6 +170,7 @@ fn as_str(value: &Value) -> String {
         Value::Bool(flag) => flag.to_string(),
         Value::I64(number) => number.to_string(),
         Value::F64(number) => number.to_string(),
+        Value::Timestamp { .. } | Value::Decimal { .. } => value.csv_string(""),
         Value::Null => String::new(),
     }
 }
@@ -183,6 +184,7 @@ fn as_bool(value: &Value) -> Result<bool> {
             "false" | "f" | "0" | "no" => Ok(false),
             other => bail!("`{}` is not a boolean", other),
         },
+        Value::Decimal { units, .. } => Ok(*units != 0),
         other => bail!("cannot read a boolean from {:?}", other),
     }
 }
@@ -196,6 +198,9 @@ fn as_int(value: &Value, min: i128, max: i128) -> Result<i128> {
             .trim()
             .parse::<i128>()
             .map_err(|_| anyhow!("`{}` is not an integer", text))?,
+        // Truncates towards zero, matching the F64 arm above.
+        Value::Decimal { units, scale } => units / 10i128.pow(*scale),
+        Value::Timestamp { .. } => bail!("cannot read an integer from a timestamp"),
         Value::Null => unreachable!("nulls are handled before conversion"),
     };
     if number < min || number > max {
@@ -212,12 +217,22 @@ fn as_f64(value: &Value) -> Result<f64> {
             .trim()
             .parse::<f64>()
             .map_err(|_| anyhow!("`{}` is not a number", text)),
+        Value::Decimal { units, scale } => Ok(*units as f64 / 10f64.powi(*scale as i32)),
         other => bail!("cannot read a number from {:?}", other),
     }
 }
 
 /// Parse a decimal into its unscaled 128-bit form at the column's scale.
 fn as_decimal(value: &Value, precision: u8, scale: u8) -> Result<i128> {
+    // A generator that already knows the number hands it over directly. Only
+    // literals from a spec file take the text path below.
+    if let Value::Decimal {
+        units,
+        scale: value_scale,
+    } = value
+    {
+        return rescale_decimal(*units, *value_scale, precision, scale);
+    }
     let text = match value {
         Value::String(text) => text.trim().to_string(),
         Value::I64(number) => number.to_string(),
@@ -266,7 +281,50 @@ fn as_decimal(value: &Value, precision: u8, scale: u8) -> Result<i128> {
     Ok(if negative { -unscaled } else { unscaled })
 }
 
+/// Move an unscaled decimal from `from_scale` to the column's scale,
+/// refusing anything that would drop digits or overflow the precision.
+fn rescale_decimal(units: i128, from_scale: u32, precision: u8, scale: u8) -> Result<i128> {
+    let target = scale as u32;
+    let unscaled = if from_scale == target {
+        units
+    } else if from_scale < target {
+        units
+            .checked_mul(10i128.pow(target - from_scale))
+            .ok_or_else(|| anyhow!("decimal does not fit a 128-bit value"))?
+    } else {
+        let divisor = 10i128.pow(from_scale - target);
+        if units % divisor != 0 {
+            bail!(
+                "`{}` has {} decimal places but the column holds {}",
+                format_units(units, from_scale),
+                from_scale,
+                scale
+            );
+        }
+        units / divisor
+    };
+    let limit = 10i128
+        .checked_pow(precision as u32)
+        .ok_or_else(|| anyhow!("precision {} is too large", precision))?;
+    if unscaled.unsigned_abs() >= limit.unsigned_abs() {
+        bail!(
+            "`{}` exceeds the column's precision of {}",
+            format_units(units, from_scale),
+            precision
+        );
+    }
+    Ok(unscaled)
+}
+
+/// Only used to name a value in an error message.
+fn format_units(units: i128, scale: u32) -> String {
+    Value::Decimal { units, scale }.csv_string("")
+}
+
 fn as_date(value: &Value) -> Result<i32> {
+    if let Value::Timestamp { micros, .. } = value {
+        return Ok(micros.div_euclid(MICROS_PER_DAY) as i32);
+    }
     let text = as_str(value);
     let trimmed = text.trim();
     // Accept a full timestamp and keep only the date part.
@@ -277,7 +335,13 @@ fn as_date(value: &Value) -> Result<i32> {
     Ok((date - epoch).num_days() as i32)
 }
 
+const MICROS_PER_DAY: i64 = 24 * 60 * 60 * 1_000_000;
+
 fn as_timestamp_micros(value: &Value) -> Result<i64> {
+    // The whole point of Value::Timestamp: no format, no parse.
+    if let Value::Timestamp { micros, .. } = value {
+        return Ok(*micros);
+    }
     let text = as_str(value);
     let trimmed = text.trim();
     const FORMATS: [&str; 4] = [
@@ -415,6 +479,64 @@ mod tests {
         let schema = arrow_schema(&tables[0].columns).unwrap();
         assert!(!schema.field(0).is_nullable());
         assert!(schema.field(1).is_nullable());
+    }
+
+    /// The typed fast path exists only as an optimisation, so it has to agree
+    /// with parsing the text the same value renders to.
+    #[test]
+    fn typed_decimals_agree_with_the_text_path() {
+        for (units, scale) in [(451_200i128, 4u32), (-451_200, 4), (10_000, 4), (7, 4)] {
+            let typed = Value::Decimal { units, scale };
+            let text = Value::String(typed.csv_string(""));
+            assert_eq!(
+                as_decimal(&typed, 19, 4).unwrap(),
+                as_decimal(&text, 19, 4).unwrap(),
+                "disagreement on {:?}",
+                typed
+            );
+        }
+        // A coarser value than the column scales up, exactly as the text does.
+        let coarse = Value::Decimal {
+            units: 4512,
+            scale: 2,
+        };
+        assert_eq!(as_decimal(&coarse, 19, 4).unwrap(), 451_200);
+    }
+
+    #[test]
+    fn typed_decimals_refuse_to_drop_digits_or_overflow() {
+        // 0.123456 at scale 6 does not fit a scale-4 column.
+        let too_precise = Value::Decimal {
+            units: 123_456,
+            scale: 6,
+        };
+        assert!(as_decimal(&too_precise, 19, 4).is_err());
+        // 12345.60 does not fit precision 5.
+        let too_large = Value::Decimal {
+            units: 1_234_560,
+            scale: 2,
+        };
+        assert!(as_decimal(&too_large, 5, 2).is_err());
+    }
+
+    #[test]
+    fn typed_timestamps_agree_with_the_text_path() {
+        let format: Arc<str> = Arc::from("%Y-%m-%d %H:%M:%S%.6f");
+        for micros in [1_757_500_000_123_456i64, 0, -86_400_000_000] {
+            let typed = Value::Timestamp {
+                micros,
+                format: format.clone(),
+            };
+            let text = Value::String(typed.csv_string(""));
+            assert_eq!(as_timestamp_micros(&typed).unwrap(), micros);
+            assert_eq!(as_timestamp_micros(&text).unwrap(), micros);
+            assert_eq!(
+                as_date(&typed).unwrap(),
+                as_date(&text).unwrap(),
+                "date disagreement at {}",
+                micros
+            );
+        }
     }
 
     #[test]
