@@ -1,10 +1,16 @@
-# S3 target for generated Parquet files.
+# Template S3 target. Copy this to s3.local.toml and edit:
+#
+#   cp s3.toml s3.local.toml
+#
+# Anything matching *.local.* is gitignored, so your real bucket and any
+# credentials stay out of the repository. run.sh reads s3.local.toml.
+#
 # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
 # environment, so no [s3.credentials] section is needed here.
 
 [s3]
-bucket = "wushilin-singapore"
-prefix = "datagen/dbo_invoiceevent_state/"
+bucket = "my-bucket"
+prefix = "datagen/my_table/"
 region = "ap-southeast-1"
 
 [upload]

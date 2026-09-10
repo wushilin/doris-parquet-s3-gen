@@ -14,7 +14,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 BIN="./target/release/doris-parquet-s3-gen"
 SCHEMA="sample.sql"
 SPEC="sample.spec"
-S3_CONFIG="s3.toml"
+S3_CONFIG="s3.local.toml"
 TARGET_SIZE="10GiB"
 FILE_SIZE="2GiB"
 THREADS=""
@@ -32,7 +32,7 @@ usage() {
 Options:
   -s, --schema FILE     Doris CREATE TABLE file      (default: sample.sql)
   -p, --spec FILE       field generation spec        (default: sample.spec)
-  -c, --config FILE     S3 config TOML               (default: s3.toml)
+  -c, --config FILE     S3 config TOML          (default: s3.local.toml)
   -t, --target SIZE     stop after this much Parquet (default: 10GiB)
   -f, --file-size SIZE  roll to a new object at      (default: 2GiB)
   -j, --threads N       generation threads           (default: CPU count)
@@ -78,8 +78,15 @@ if [[ -n "$LOCAL_DIR" ]]; then
   DEST_ARGS=(--out-dir "$LOCAL_DIR")
   DEST_LABEL="$LOCAL_DIR"
 else
-  [[ -f "$S3_CONFIG" ]] || die "S3 config '$S3_CONFIG' not found; create one with:
+  if [[ ! -f "$S3_CONFIG" ]]; then
+    if [[ -f "s3.toml" ]]; then
+      die "S3 config '$S3_CONFIG' not found. Copy the template and edit it:
+    cp s3.toml $S3_CONFIG
+Anything matching *.local.* is gitignored, so your bucket stays out of git."
+    fi
+    die "S3 config '$S3_CONFIG' not found; create one with:
     $BIN --emit-s3-config $S3_CONFIG"
+  fi
 
   # Credentials may come from the environment, a profile, or the config file.
   if ! grep -q '^[[:space:]]*access_key_id' "$S3_CONFIG"; then

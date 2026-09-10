@@ -41,6 +41,27 @@ pub struct Snapshot {
     pub finished: bool,
 }
 
+// Every varying field is padded to a reserved width. Numbers then grow into
+// their own space instead of pushing the labels after them sideways, so the
+// block stays still while it updates.
+/// "9,999,999" rows per second.
+const W_ROWS_RATE: usize = 9;
+/// "1023 MiB".
+const W_BYTES: usize = 8;
+/// "1023 MiB/s".
+const W_BYTE_RATE: usize = 10;
+/// "upload-bound".
+const W_STATE: usize = 12;
+/// "done in 1h05m".
+const W_TIMING: usize = 13;
+/// Completed file count.
+const W_FILES: usize = 3;
+/// The leading label: "rows", "gen", "up", "file".
+const W_LABEL: usize = 4;
+/// The primary field on the gen and up lines, so their pairs share a column.
+/// Sized by the wider of the two: rate + " rows/s " + state.
+const W_PRIMARY: usize = W_ROWS_RATE + 8 + W_STATE;
+
 /// Below this the progress bar is dropped.
 const BAR_MIN_WIDTH: usize = 68;
 /// Below this the layout switches to the compact two-line form.
@@ -69,22 +90,36 @@ fn render_full(snapshot: &Snapshot, width: usize) -> Vec<String> {
     // Line 2: generation side. There is no byte rate here on purpose: a row's
     // size is not known until its row group is encoded, so the only honest
     // byte rate belongs to the upload line below.
-    let generating = if snapshot.draining {
-        "draining".to_string()
+    //
+    // Generators blocked on a full queue are feeling upload backpressure, not
+    // stalling. Say so, or a zero rate looks like a hang.
+    let state = if snapshot.draining {
+        "draining"
     } else if snapshot.queued >= snapshot.queue_capacity && snapshot.queue_capacity > 0 {
-        // Generators are blocked on a full queue, which is upload backpressure
-        // rather than a stall. Say so, or a zero rate looks like a hang.
-        format!("{} rows/s upload-bound", fmt_count(snapshot.rows_per_sec as u64))
+        "upload-bound"
     } else {
-        format!("{} rows/s", fmt_count(snapshot.rows_per_sec as u64))
+        ""
     };
-    lines.push(pair_line(
+    let generating = format!(
+        "{} rows/s {}",
+        rjust(&fmt_count(snapshot.rows_per_sec as u64), W_ROWS_RATE),
+        ljust(state, W_STATE),
+    );
+    let queue_digits = digits(snapshot.queue_capacity as u64);
+    lines.push(columns_line(
         "gen",
         &generating,
         &[
-            ("threads", snapshot.threads.to_string()),
-            ("queue", format!("{}/{}", snapshot.queued, snapshot.queue_capacity)),
-            ("buffered", fmt_bytes(snapshot.buffered_bytes)),
+            ("threads", rjust(&snapshot.threads.to_string(), 2)),
+            (
+                "queue",
+                format!(
+                    "{}/{}",
+                    rjust(&snapshot.queued.to_string(), queue_digits),
+                    snapshot.queue_capacity
+                ),
+            ),
+            ("buffered", rjust(&fmt_bytes(snapshot.buffered_bytes), W_BYTES)),
         ],
         width,
         short,
@@ -92,17 +127,24 @@ fn render_full(snapshot: &Snapshot, width: usize) -> Vec<String> {
 
     // Line 3: upload side.
     let active = snapshot.active_files.len();
-    let files = if active > 0 {
-        format!("{} done, {} active", snapshot.files_completed, active)
-    } else {
-        format!("{} done, {} writers", snapshot.files_completed, snapshot.writers)
-    };
-    lines.push(pair_line(
+    let upload = format!(
+        "{} done, {} {}",
+        rjust(&snapshot.files_completed.to_string(), W_FILES),
+        rjust(&if active > 0 { active } else { snapshot.writers }.to_string(), 2),
+        ljust(if active > 0 { "active" } else { "writers" }, 7),
+    );
+    lines.push(columns_line(
         "up",
-        &files,
+        &upload,
         &[
-            ("sent", fmt_bytes(snapshot.bytes_uploaded)),
-            ("rate", format!("{}/s", fmt_bytes(snapshot.upload_bytes_per_sec as u64))),
+            ("sent", rjust(&fmt_bytes(snapshot.bytes_uploaded), W_BYTES)),
+            (
+                "rate",
+                rjust(
+                    &format!("{}/s", fmt_bytes(snapshot.upload_bytes_per_sec as u64)),
+                    W_BYTE_RATE,
+                ),
+            ),
         ],
         width,
         short,
@@ -113,6 +155,38 @@ fn render_full(snapshot: &Snapshot, width: usize) -> Vec<String> {
         lines.push(active_files_line(snapshot, width));
     }
     lines
+}
+
+/// A label, a fixed-width primary field, then key/value pairs.
+///
+/// Both the label and the primary field are padded to constant widths, so the
+/// pairs on every line begin at the same column and stay there as the numbers
+/// underneath them change.
+fn columns_line(
+    label: &str,
+    primary: &str,
+    pairs: &[(&str, String)],
+    width: usize,
+    short: bool,
+) -> String {
+    let mut out = format!("{}{}", label_cell(label), ljust(primary, W_PRIMARY));
+    for (key, value) in pairs {
+        let key = if short { &key[..key.len().min(3)] } else { *key };
+        let piece = format!("  {} {}", key, value);
+        // Stop at the first pair that will not fit. Pairs are ordered by
+        // importance, and skipping one to fit a later shorter one would make
+        // fields appear and vanish between redraws.
+        if out.chars().count() + piece.chars().count() > width {
+            break;
+        }
+        out.push_str(&piece);
+    }
+    out
+}
+
+/// The leading label, padded so every line's content starts in one column.
+fn label_cell(label: &str) -> String {
+    format!(" {} ", ljust(label, W_LABEL))
 }
 
 fn render_compact(snapshot: &Snapshot, width: usize) -> Vec<String> {
@@ -148,13 +222,18 @@ fn render_compact(snapshot: &Snapshot, width: usize) -> Vec<String> {
 }
 
 fn progress_line(snapshot: &Snapshot, width: usize, short: bool) -> String {
-    let label = " rows ";
+    let label = label_cell("rows");
+    let label = label.as_str();
     let timing = tail_timing(snapshot);
 
     let Some((done, target)) = progress_target(snapshot) else {
         // No target: show the count and elapsed time only.
         let counts = fmt_count(snapshot.rows);
-        return pad_between(&format!("{}{}", label, counts), &timing, width);
+        return pad_between(
+            &format!("{}{}", label, counts),
+            &rjust(&timing, W_TIMING),
+            width,
+        );
     };
 
     // Right-align the running count against the target so digits do not jitter.
@@ -178,17 +257,22 @@ fn progress_line(snapshot: &Snapshot, width: usize, short: bool) -> String {
 
     let head = format!("{}{}  {:>4}", label, counts, percent);
     if short || width < BAR_MIN_WIDTH {
-        return pad_between(&head, &timing, width);
+        return pad_between(&head, &rjust(&timing, W_TIMING), width);
     }
 
-    // Give the bar whatever space is left, within sane bounds.
-    let used = head.chars().count() + timing.chars().count() + 4;
+    // Size the bar against the reserved timing width, not the current text,
+    // or the bar would grow and shrink as the estimate changes.
+    let used = head.chars().count() + W_TIMING + 4;
     let bar_width = width.saturating_sub(used).clamp(0, 36);
     if bar_width < 8 {
-        return pad_between(&head, &timing, width);
+        return pad_between(&head, &rjust(&timing, W_TIMING), width);
     }
     let bar = fmt_bar(done, target, bar_width);
-    pad_between(&format!("{}  {}", head, bar), &timing, width)
+    pad_between(
+        &format!("{}  {}", head, bar),
+        &rjust(&timing, W_TIMING),
+        width,
+    )
 }
 
 /// `label value` on the left, `key value` pairs packed to the right.
@@ -215,12 +299,17 @@ fn pair_line(label: &str, value: &str, pairs: &[(&str, String)], width: usize, s
 }
 
 fn active_files_line(snapshot: &Snapshot, width: usize) -> String {
-    let mut out = String::from(" file ");
+    let mut out = label_cell("file");
     let mut first = true;
     for file in &snapshot.active_files {
         let piece = match snapshot.file_cap {
-            Some(cap) => format!("{} {}/{}", file.name, fmt_bytes(file.bytes), fmt_bytes(cap)),
-            None => format!("{} {}", file.name, fmt_bytes(file.bytes)),
+            Some(cap) => format!(
+                "{} {}/{}",
+                file.name,
+                rjust(&fmt_bytes(file.bytes), W_BYTES),
+                fmt_bytes(cap)
+            ),
+            None => format!("{} {}", file.name, rjust(&fmt_bytes(file.bytes), W_BYTES)),
         };
         let sep = if first { "" } else { "  " };
         if out.chars().count() + sep.chars().count() + piece.chars().count() > width {
@@ -378,6 +467,28 @@ fn pad_between(left: &str, right: &str, width: usize) -> String {
     format!("{}{}{} ", left, " ".repeat(gap), right)
 }
 
+/// Right-align inside a reserved field so digits grow leftwards into padding.
+fn rjust(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        return text.to_string();
+    }
+    format!("{}{}", " ".repeat(width - len), text)
+}
+
+/// Left-align inside a reserved field, for words rather than numbers.
+fn ljust(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        return text.to_string();
+    }
+    format!("{}{}", text, " ".repeat(width - len))
+}
+
+fn digits(value: u64) -> usize {
+    value.to_string().len()
+}
+
 fn clip(text: &str, width: usize) -> String {
     truncate(text, width)
 }
@@ -531,5 +642,84 @@ mod tests {
         snapshot.queued = 3;
         let running = render(&snapshot, 120).join("\n");
         assert!(!running.contains("upload-bound"), "{}", running);
+    }
+
+    /// The point of the reserved widths: labels must not move as numbers grow.
+    #[test]
+    fn field_positions_do_not_move_as_numbers_change() {
+        let small = Snapshot {
+            elapsed: Duration::from_secs(3),
+            threads: 4,
+            writers: 8,
+            queued: 0,
+            queue_capacity: 30,
+            rows: 7,
+            target_rows: Some(50_000_000),
+            bytes_generated: 12,
+            bytes_uploaded: 12,
+            target_bytes: None,
+            buffered_bytes: 0,
+            files_completed: 0,
+            active_files: vec![ActiveFile { name: "part-w00-000001.parquet".into(), bytes: 3 }],
+            rows_per_sec: 4.0,
+            gen_bytes_per_sec: 0.0,
+            upload_bytes_per_sec: 9.0,
+            file_cap: Some(2 << 30),
+            draining: false,
+            finished: false,
+        };
+        let large = Snapshot {
+            elapsed: Duration::from_secs(9999),
+            rows: 49_999_999,
+            bytes_generated: 900_000_000_000,
+            bytes_uploaded: 900_000_000_000,
+            buffered_bytes: 999 << 20,
+            files_completed: 987,
+            queued: 30,
+            rows_per_sec: 9_876_543.0,
+            upload_bytes_per_sec: 987_654_321.0,
+            active_files: vec![ActiveFile {
+                name: "part-w00-000001.parquet".into(),
+                bytes: 2_000_000_000,
+            }],
+            ..small.clone()
+        };
+
+        for width in [80usize, 100, 120] {
+            let a = render(&small, width);
+            let b = render(&large, width);
+            assert_eq!(a.len(), b.len(), "line count moved at width {}", width);
+            for (line_a, line_b) in a.iter().zip(&b) {
+                for label in ["threads", "queue", "buffered", "sent", "rate", "done"] {
+                    assert_eq!(
+                        line_a.find(label),
+                        line_b.find(label),
+                        "`{}` moved at width {}:\n  {:?}\n  {:?}",
+                        label,
+                        width,
+                        line_a,
+                        line_b
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lines_share_one_left_column() {
+        let snapshot = sample();
+        let lines = render(&snapshot, 110);
+        // Every label sits in the same fixed-width cell, so the content after
+        // it starts at one column on every line.
+        let starts: Vec<usize> = lines
+            .iter()
+            .map(|line| line.len() - line.trim_start().len())
+            .collect();
+        assert!(starts.iter().all(|start| *start == starts[0]), "{:?}", lines);
+        for line in &lines {
+            let cell: String = line.chars().take(W_LABEL + 2).collect();
+            assert_eq!(cell.chars().count(), W_LABEL + 2);
+            assert!(cell.starts_with(' ') && cell.ends_with(' '), "{:?}", cell);
+        }
     }
 }
