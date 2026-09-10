@@ -7,7 +7,7 @@ context:
   reset: row
 
 batch:
-  rows: 1000
+  rows: 10000
 
 fields:
   # A real UUID, and deliberately so. These three id columns are what make a

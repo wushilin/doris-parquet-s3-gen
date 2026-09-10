@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 arrow = "59.3.0"
 async-channel = "2.5.0"
 base64 = "0.22"

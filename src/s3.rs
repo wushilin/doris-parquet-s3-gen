@@ -5,9 +5,12 @@
 //! value is validated against the limits S3 actually enforces.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use object_store::aws::AmazonS3Builder;
+use object_store::{BackoffConfig, ClientOptions, ObjectStore, RetryConfig};
 use serde::Deserialize;
 
 /// S3 requires every part except the last to be at least this large.
@@ -187,7 +190,7 @@ where
     let raw = SizeOrInt::deserialize(deserializer)?;
     match raw {
         SizeOrInt::Int(value) => Ok(value),
-        SizeOrInt::Text(text) => crate::parse_byte_size(&text).map_err(D::Error::custom),
+        SizeOrInt::Text(text) => crate::units::parse_byte_size(&text).map_err(D::Error::custom),
     }
 }
 
@@ -199,7 +202,7 @@ where
     let raw = SizeOrInt::deserialize(deserializer)?;
     match raw {
         SizeOrInt::Int(value) => Ok(Duration::from_secs(value)),
-        SizeOrInt::Text(text) => crate::parse_duration(&text).map_err(D::Error::custom),
+        SizeOrInt::Text(text) => crate::units::parse_duration(&text).map_err(D::Error::custom),
     }
 }
 
@@ -327,6 +330,81 @@ impl OutputConfig {
     }
 }
 
+
+impl OutputConfig {
+    /// Build the object store this config describes, and the key prefix every
+    /// object goes under. Lives here rather than in `sink` so a tool that only
+    /// needs to talk to the bucket does not pull in arrow and parquet.
+    pub fn build_object_store(&self) -> Result<(Arc<dyn ObjectStore>, String)> {
+        // from_env picks up AWS_ACCESS_KEY_ID and friends; explicit
+        // credentials in the config file override it.
+        let mut builder = AmazonS3Builder::from_env().with_bucket_name(&self.s3.bucket);
+        if let Some(region) = &self.s3.region {
+            builder = builder.with_region(region);
+        }
+        if let Some(endpoint) = &self.s3.endpoint {
+            // object_store never rewrites the host: with virtual-hosted style
+            // it uses the endpoint verbatim and appends the key, so an endpoint
+            // without the bucket addresses the wrong object.
+            let endpoint = if self.s3.path_style {
+                endpoint.clone()
+            } else {
+                virtual_hosted_endpoint(endpoint, &self.s3.bucket)
+            };
+            builder = builder.with_endpoint(endpoint);
+        }
+        if self.s3.allow_http {
+            builder = builder.with_allow_http(true);
+        }
+        builder = builder
+            .with_retry(RetryConfig {
+                backoff: BackoffConfig {
+                    init_backoff: Duration::from_millis(100),
+                    max_backoff: self.upload.max_backoff,
+                    base: 2.0,
+                },
+                max_retries: self.upload.retries as usize,
+                retry_timeout: self.upload.retry_timeout,
+            })
+            .with_client_options(ClientOptions::new().with_timeout(self.upload.timeout));
+        // Always set this explicitly. object_store defaults to path style, so
+        // only ever passing `false` left virtual-hosted style unreachable,
+        // which S3-compatible services such as Alibaba OSS require.
+        builder = builder.with_virtual_hosted_style_request(!self.s3.path_style);
+        if let Some(credentials) = &self.s3.credentials {
+            builder = builder
+                .with_access_key_id(&credentials.access_key_id)
+                .with_secret_access_key(&credentials.secret_access_key);
+            if let Some(token) = &credentials.session_token {
+                if !token.is_empty() {
+                    builder = builder.with_token(token);
+                }
+            }
+        }
+        let store = builder
+            .build()
+            .context("failed to construct the S3 client; check bucket, region and credentials")?;
+        Ok((Arc::new(store), self.normalised_prefix()))
+    }
+}
+
+/// Put the bucket in front of the endpoint host, the way virtual-hosted
+/// addressing wants it: `https://oss-cn-beijing.aliyuncs.com` with bucket
+/// `zyk-bj` becomes `https://zyk-bj.oss-cn-beijing.aliyuncs.com`. An endpoint
+/// that already names the bucket is left alone, so both spellings work.
+fn virtual_hosted_endpoint(endpoint: &str, bucket: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some(split) => split,
+        // Validation in s3.rs rejects a scheme-less endpoint, so this only
+        // guards against a caller that skipped it.
+        None => return trimmed.to_string(),
+    };
+    if rest.starts_with(&format!("{}.", bucket)) {
+        return trimmed.to_string();
+    }
+    format!("{}://{}.{}", scheme, bucket, rest)
+}
 /// A commented starter config, written by `--emit-s3-config`.
 pub const SAMPLE_TOML: &str = r#"# S3 target for generated Parquet files.
 # Written by --emit-s3-config. Pass it back with --s3-config.
@@ -502,6 +580,24 @@ mod tests {
         assert_eq!(config.upload.max_backoff, Duration::from_secs(120));
         // Zero is meaningful: fail the run on the first unrecoverable upload.
         assert_eq!(config.upload.file_retries, 0);
+    }
+
+    #[test]
+    fn puts_the_bucket_in_the_endpoint_host() {
+        assert_eq!(
+            virtual_hosted_endpoint("https://oss-cn-beijing-internal.aliyuncs.com", "zyk-bj"),
+            "https://zyk-bj.oss-cn-beijing-internal.aliyuncs.com"
+        );
+        // A trailing slash must not end up inside the host.
+        assert_eq!(
+            virtual_hosted_endpoint("https://oss-cn-beijing.aliyuncs.com/", "zyk-bj"),
+            "https://zyk-bj.oss-cn-beijing.aliyuncs.com"
+        );
+        // Already spelled out, so leave it alone rather than double it up.
+        assert_eq!(
+            virtual_hosted_endpoint("https://zyk-bj.oss-cn-beijing.aliyuncs.com", "zyk-bj"),
+            "https://zyk-bj.oss-cn-beijing.aliyuncs.com"
+        );
     }
 
     #[test]

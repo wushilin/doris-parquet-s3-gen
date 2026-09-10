@@ -15,8 +15,6 @@ use arrow::record_batch::RecordBatch;
 use object_store::buffered::BufWriter;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::aws::AmazonS3Builder;
-use object_store::{BackoffConfig, ClientOptions, RetryConfig};
 use object_store::ObjectStore;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
@@ -121,64 +119,7 @@ pub fn parse_compression(name: &str, level: Option<i32>) -> Result<Compression> 
 /// Build the object store and the key prefix every file is written under.
 pub fn build_store(destination: &Destination) -> Result<(Arc<dyn ObjectStore>, String)> {
     match destination {
-        Destination::S3 { config } => {
-            // from_env picks up AWS_ACCESS_KEY_ID and friends; explicit
-            // credentials in the config file override it.
-            let mut builder = AmazonS3Builder::from_env().with_bucket_name(&config.s3.bucket);
-            if let Some(region) = &config.s3.region {
-                builder = builder.with_region(region);
-            }
-            if let Some(endpoint) = &config.s3.endpoint {
-                // object_store never rewrites the host: with virtual-hosted
-                // style it uses the endpoint verbatim and appends the key, so
-                // an endpoint without the bucket addresses the wrong object.
-                let endpoint = if config.s3.path_style {
-                    endpoint.clone()
-                } else {
-                    virtual_hosted_endpoint(endpoint, &config.s3.bucket)
-                };
-                builder = builder.with_endpoint(endpoint);
-            }
-            if config.s3.allow_http {
-                builder = builder.with_allow_http(true);
-            }
-            // These were parsed and then dropped on the floor, leaving every
-            // run on object_store's defaults: ten attempts inside a
-            // three-minute window. Three minutes is not a lot of cover for a
-            // job that runs for days.
-            builder = builder
-                .with_retry(RetryConfig {
-                    backoff: BackoffConfig {
-                        init_backoff: std::time::Duration::from_millis(100),
-                        max_backoff: config.upload.max_backoff,
-                        base: 2.0,
-                    },
-                    max_retries: config.upload.retries as usize,
-                    retry_timeout: config.upload.retry_timeout,
-                })
-                .with_client_options(
-                    ClientOptions::new().with_timeout(config.upload.timeout),
-                );
-            // Always set this explicitly. object_store defaults to path style,
-            // so only ever passing `false` left virtual-hosted style
-            // unreachable, which S3-compatible services such as Alibaba OSS
-            // require.
-            builder = builder.with_virtual_hosted_style_request(!config.s3.path_style);
-            if let Some(credentials) = &config.s3.credentials {
-                builder = builder
-                    .with_access_key_id(&credentials.access_key_id)
-                    .with_secret_access_key(&credentials.secret_access_key);
-                if let Some(token) = &credentials.session_token {
-                    if !token.is_empty() {
-                        builder = builder.with_token(token);
-                    }
-                }
-            }
-            let store = builder
-                .build()
-                .context("failed to construct the S3 client; check bucket, region and credentials")?;
-            Ok((Arc::new(store), config.normalised_prefix()))
-        }
+        Destination::S3 { config } => config.build_object_store(),
         Destination::Local { directory } => {
             std::fs::create_dir_all(directory).with_context(|| {
                 format!("failed to create output directory {}", directory.display())
@@ -191,23 +132,6 @@ pub fn build_store(destination: &Destination) -> Result<(Arc<dyn ObjectStore>, S
     }
 }
 
-/// Put the bucket in front of the endpoint host, the way virtual-hosted
-/// addressing wants it: `https://oss-cn-beijing.aliyuncs.com` with bucket
-/// `zyk-bj` becomes `https://zyk-bj.oss-cn-beijing.aliyuncs.com`. An endpoint
-/// that already names the bucket is left alone, so both spellings work.
-fn virtual_hosted_endpoint(endpoint: &str, bucket: &str) -> String {
-    let trimmed = endpoint.trim_end_matches('/');
-    let (scheme, rest) = match trimmed.split_once("://") {
-        Some(split) => split,
-        // Validation in s3.rs rejects a scheme-less endpoint, so this only
-        // guards against a caller that skipped it.
-        None => return trimmed.to_string(),
-    };
-    if rest.starts_with(&format!("{}.", bucket)) {
-        return trimmed.to_string();
-    }
-    format!("{}://{}.{}", scheme, bucket, rest)
-}
 
 /// Move a shared gauge by the difference, tracking what this writer reported.
 fn apply_delta(gauge: &AtomicU64, reported: &mut u64, current: u64) {
@@ -452,25 +376,6 @@ impl ParquetSink {
 
 #[cfg(test)]
 mod tests {
-    use super::virtual_hosted_endpoint;
-
-    #[test]
-    fn puts_the_bucket_in_the_endpoint_host() {
-        assert_eq!(
-            virtual_hosted_endpoint("https://oss-cn-beijing-internal.aliyuncs.com", "zyk-bj"),
-            "https://zyk-bj.oss-cn-beijing-internal.aliyuncs.com"
-        );
-        // A trailing slash must not end up inside the host.
-        assert_eq!(
-            virtual_hosted_endpoint("https://oss-cn-beijing.aliyuncs.com/", "zyk-bj"),
-            "https://zyk-bj.oss-cn-beijing.aliyuncs.com"
-        );
-        // Already spelled out, so leave it alone rather than double it up.
-        assert_eq!(
-            virtual_hosted_endpoint("https://zyk-bj.oss-cn-beijing.aliyuncs.com", "zyk-bj"),
-            "https://zyk-bj.oss-cn-beijing.aliyuncs.com"
-        );
-    }
 
     use super::*;
     use crate::parquet_out::BatchBuilder;

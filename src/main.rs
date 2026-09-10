@@ -1,4 +1,7 @@
 mod derive;
+// format_bytes and group_digits are for calcsize; this binary uses neither.
+#[allow(dead_code)]
+mod units;
 #[allow(dead_code)]
 mod parquet_out;
 // Fields become live when the S3 sink lands.
@@ -34,6 +37,8 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+
+use crate::units::{parse_byte_size, parse_duration};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Generate data from a Doris schema and stream it to S3 as Parquet")]
@@ -2813,71 +2818,7 @@ fn default_run_id() -> String {
     )
 }
 
-fn parse_byte_size(value: &str) -> std::result::Result<u64, String> {
-    let value = value.trim();
-    let split = value
-        .find(|c: char| c.is_ascii_alphabetic())
-        .unwrap_or(value.len());
-    let (num_str, unit_str) = value.split_at(split);
-    let num: f64 = num_str
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid byte size '{value}'"))?;
-    if num < 0.0 {
-        return Err(format!("byte size must be non-negative: '{value}'"));
-    }
-    let multiplier: f64 = match unit_str.trim().to_ascii_lowercase().as_str() {
-        "" => 1.0,
-        "k" | "kb" | "kib" => 1024.0,
-        "m" | "mb" | "mib" => 1024.0 * 1024.0,
-        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        // A tool whose job is multi-terabyte datasets should be able to say
-        // so without counting gibibytes.
-        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "p" | "pb" | "pib" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        other => return Err(format!("unknown byte unit '{other}' in '{value}'")),
-    };
-    let bytes = (num * multiplier).ceil();
-    if bytes > u64::MAX as f64 {
-        return Err(format!("byte size overflow in '{value}'"));
-    }
-    Ok(bytes as u64)
-}
 
-fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
-    let mut total = 0u64;
-    let mut number = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_digit() {
-            number.push(ch);
-            continue;
-        }
-        if number.is_empty() {
-            return Err(format!("invalid duration '{value}'"));
-        }
-        let parsed = number
-            .parse::<u64>()
-            .map_err(|_| format!("invalid duration '{value}'"))?;
-        number.clear();
-        match ch {
-            'h' => total = total.saturating_add(parsed.saturating_mul(3600)),
-            'm' => total = total.saturating_add(parsed.saturating_mul(60)),
-            's' => total = total.saturating_add(parsed),
-            _ => return Err(format!("invalid duration unit '{ch}' in '{value}'")),
-        }
-    }
-    if !number.is_empty() {
-        total = total.saturating_add(
-            number
-                .parse::<u64>()
-                .map_err(|_| format!("invalid duration '{value}'"))?,
-        );
-    }
-    if total == 0 {
-        return Err("duration must be greater than zero".into());
-    }
-    Ok(Duration::from_secs(total))
-}
 
 fn should_emit_null(null_rate: Option<f64>, rng: &mut StdRng) -> Result<bool> {
     let Some(rate) = null_rate else {
