@@ -10,16 +10,25 @@ batch:
   rows: 1000
 
 fields:
-  # Unique 36-character key, UUID-shaped so it still fits varchar(256) and
-  # still costs 36 bytes per row. A counter rather than `type: uuid` because
-  # dense strings compress: the three id columns here are the difference
-  # between 358 MiB and 139 MiB of Parquet per 4M rows. Switch back to
-  # `type: uuid` when the point of the run is random, incompressible data.
+  # A counter zero-padded to 36 characters: same width as the UUID this used
+  # to be, so it still fits varchar(256) and still costs 36 bytes per row.
+  # A counter rather than `type: uuid` because dense strings compress, and the
+  # three id columns here are the difference between 358 MiB and 139 MiB of
+  # Parquet per 4M rows. Switch back to `type: uuid` when the point of the run
+  # is random, incompressible data.
+  #
+  # The literal prefix carries 16 of the 36 characters, so only 20 digits are
+  # zero-padded per value. That is worth about 5% on the whole pipeline over
+  # padding all 36, and 20 digits is past the u64 counter range, so it cannot
+  # overflow. A UUID-shaped template would leave only the last group, twelve
+  # digits, and 40 TB of this data is about 1.1e12 rows -- past that ceiling.
+  # The prefix also keeps the three id columns from being copies of each other.
   - name: invoiceid
     order: 0
     gen:
       type: sequence_string
-      template: "00000000-0000-4000-8000-{}"
+      template: "inv0000000000000{}"
+      width: 36
 
   # Partition key: AUTO PARTITION BY RANGE(date_trunc(eventdate, 'week')).
   # A 30-day window produces about five weekly partitions.
@@ -38,13 +47,15 @@ fields:
     order: 2
     gen:
       type: sequence_string
-      template: "00000000-0000-4000-9000-{}"
+      template: "org0000000000000{}"
+      width: 36
 
   - name: eventid
     order: 3
     gen:
       type: sequence_string
-      template: "00000000-0000-4000-a000-{}"
+      template: "evt0000000000000{}"
+      width: 36
 
   # CDC operation. Both values are exactly 6 characters, which is the full
   # width of varchar(6), so no other verb fits without widening the column.

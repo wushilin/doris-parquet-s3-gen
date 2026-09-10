@@ -139,7 +139,7 @@ fields:
   - name: uid
     gen:
       type: sequence_string          # unique fixed-width string, no entropy draw
-      template: "00000000-0000-4000-8000-{}"   # default "{}"
+      template: "inv0000000000000{}"   # default "{}"
       width: 36                      # counter is zero-padded to fill the rest
   - name: label
     hidden: true      # generated but not written to CSV

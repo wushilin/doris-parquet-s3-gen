@@ -546,6 +546,31 @@ struct CompiledSpec {
     has_stateful_ordered: bool,
 }
 
+impl CompiledSpec {
+    /// Check every fixed-width counter against the highest index this run can
+    /// reach. Generator threads claim counter values in blocks and abandon
+    /// whatever they have not used, so allow one unfinished block each.
+    fn check_sequence_capacity(&self, rows: Option<u64>, threads: usize) -> Result<()> {
+        // Size- and time-bounded runs have no row count to check against; the
+        // per-row guard still stops them, it just cannot warn up front.
+        let Some(rows) = rows else {
+            return Ok(());
+        };
+        // A thread reaches its highest index only after every other thread has
+        // claimed a block ahead of it, so the waste is bounded by the blocks
+        // those `threads - 1` others hold, not by one block each.
+        let slack = (threads.saturating_sub(1) as u64).saturating_mul(SEQUENCE_STRING_BLOCK);
+        let highest_index = rows.saturating_sub(1).saturating_add(slack);
+        for field in self.fields.iter() {
+            field
+                .generator
+                .check_capacity(highest_index)
+                .with_context(|| format!("field `{}`", field.name))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct CsvSpecRuntime {
     delimiter: u8,
@@ -594,6 +619,27 @@ enum Generator {
 }
 
 impl Generator {
+    /// Refuse a run that would outgrow a fixed-width counter partway through,
+    /// rather than letting it discover the ceiling in hour forty.
+    fn check_capacity(&self, highest_index: u64) -> Result<()> {
+        let Generator::SequenceString(generator) = self else {
+            return Ok(());
+        };
+        let highest = generator
+            .start
+            .saturating_add(highest_index.saturating_mul(generator.step));
+        if highest > generator.max_counter {
+            bail!(
+                "this run reaches sequence_string counter {}, past the {} that {} digits \
+                 hold. Widen `width` or shorten the template's literal text.",
+                highest,
+                generator.max_counter,
+                generator.digits
+            );
+        }
+        Ok(())
+    }
+
     fn kind(&self) -> GeneratorKind {
         match self {
             // `sequence_string` is deliberately absent: it carries state, but
@@ -677,6 +723,19 @@ impl FieldGenerator for SequenceGenerator {
     }
 }
 
+/// How many distinct counters `digits` decimal characters hold, saturating at
+/// `u64::MAX`, which is the counter's own ceiling anyway.
+fn sequence_string_capacity(digits: usize) -> u64 {
+    let mut capacity: u64 = 1;
+    for _ in 0..digits {
+        match capacity.checked_mul(10) {
+            Some(next) => capacity = next,
+            None => return u64::MAX,
+        }
+    }
+    capacity
+}
+
 /// How many counter values a generator claims from the shared cursor at once.
 /// Claiming in blocks keeps the atomic off the per-row path, so the cost per
 /// row is a compare and an add.
@@ -696,6 +755,10 @@ struct SequenceStringGenerator {
     suffix: String,
     /// Zero-padding width for the counter, so the whole value hits `width`.
     digits: usize,
+    /// Largest counter that still fits `digits`. Rust's zero-padding widens
+    /// rather than truncates, so without this the values would quietly grow a
+    /// character partway through a long run instead of failing.
+    max_counter: u64,
     start: u64,
     step: u64,
     /// Next unclaimed index, shared by every clone of this generator.
@@ -714,6 +777,7 @@ impl Clone for SequenceStringGenerator {
             prefix: self.prefix.clone(),
             suffix: self.suffix.clone(),
             digits: self.digits,
+            max_counter: self.max_counter,
             start: self.start,
             step: self.step,
             cursor: self.cursor.clone(),
@@ -745,6 +809,14 @@ impl FieldGenerator for SequenceStringGenerator {
         let index = self.next_index;
         self.next_index += 1;
         let counter = self.start.saturating_add(index.saturating_mul(self.step));
+        if counter > self.max_counter {
+            bail!(
+                "sequence_string counter {} no longer fits {} digits; widen `width` \
+                 or shorten the template's literal text",
+                counter,
+                self.digits
+            );
+        }
         Ok(Value::String(format!(
             "{}{:0width$}{}",
             self.prefix,
@@ -1519,6 +1591,7 @@ async fn run_parquet(
         );
         gen_threads = 1;
     }
+    compiled.check_sequence_capacity(args.rows, gen_threads)?;
     let upload_threads = args.upload_threads.max(1);
     let queue_depth = args.queue_depth.max(1);
 
@@ -1793,6 +1866,7 @@ async fn run(args: Args) -> Result<()> {
         );
         effective_threads = 1;
     }
+    compiled.check_sequence_capacity(args.rows, effective_threads)?;
 
     let (tx, rx) = mpsc::channel::<BatchMessage>(3);
     let remaining_rows = args.rows.map(AtomicU64::new).map(Arc::new);
@@ -2260,10 +2334,20 @@ fn compile_generator(spec: GeneratorSpec) -> Result<Generator> {
             if spec.step == 0 {
                 bail!("sequence_string step must be at least 1");
             }
+            let digits = spec.width - literal;
+            if digits == 0 {
+                bail!(
+                    "sequence_string template `{}` fills the whole width of {}, \
+                     leaving no room for the counter",
+                    spec.template,
+                    spec.width
+                );
+            }
             Generator::SequenceString(SequenceStringGenerator {
                 prefix,
                 suffix,
-                digits: spec.width - literal,
+                digits,
+                max_counter: sequence_string_capacity(digits).saturating_sub(1),
                 start: spec.start,
                 step: spec.step,
                 cursor: Arc::new(AtomicU64::new(0)),
@@ -3502,6 +3586,55 @@ mod tests {
             assert!(seen.insert(value.clone()), "duplicate value {}", value);
         }
         assert_eq!(seen.len(), count * 2);
+    }
+
+    /// Zero-padding in Rust widens rather than truncates, so a counter that
+    /// outgrows its width would silently start emitting 37-character values.
+    #[test]
+    fn sequence_string_refuses_to_outgrow_its_width() {
+        let mut generator =
+            compile_gen("type: sequence_string\nwidth: 4\nstart: 9998\n").unwrap();
+        let mut rng = StdRng::seed_from_u64(3);
+        let ctx = RowContext::new();
+        for expected in ["9998", "9999"] {
+            match generator.generate(&ctx, &mut rng).unwrap() {
+                Value::String(value) => assert_eq!(value, expected),
+                other => panic!("expected a string, got {:?}", other),
+            }
+        }
+        let error = generator
+            .generate(&ctx, &mut rng)
+            .expect_err("10000 does not fit four digits");
+        assert!(error.to_string().contains("no longer fits"), "{}", error);
+    }
+
+    /// The same ceiling, caught before a long run starts rather than partway
+    /// through it.
+    #[test]
+    fn a_run_that_would_outgrow_the_width_is_refused_up_front() {
+        let spec = compile_yaml(
+            "version: 1\nfields:\n  - name: id\n    gen:\n      type: sequence_string\n      width: 4\n",
+        )
+        .unwrap();
+        assert!(spec.check_sequence_capacity(Some(1_000), 1).is_ok());
+        let error = spec
+            .check_sequence_capacity(Some(100_000), 1)
+            .expect_err("100k rows do not fit four digits");
+        let text = error.to_string();
+        assert!(text.contains("id") || format!("{:#}", error).contains("id"), "{:#}", error);
+        // No row count to check against: the per-row guard is the backstop.
+        assert!(spec.check_sequence_capacity(None, 1).is_ok());
+    }
+
+    /// 36 digits is what sample.spec uses, and it has to be beyond reach.
+    #[test]
+    fn a_full_width_counter_has_room_for_any_run() {
+        let spec = compile_yaml(
+            "version: 1\nfields:\n  - name: id\n    gen:\n      type: sequence_string\n      width: 36\n",
+        )
+        .unwrap();
+        // 1e13 rows is roughly ten times the 40 TB this data compresses to.
+        assert!(spec.check_sequence_capacity(Some(10_000_000_000_000), 64).is_ok());
     }
 
     #[test]

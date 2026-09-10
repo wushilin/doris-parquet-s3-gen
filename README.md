@@ -92,7 +92,7 @@ budget now holds 2.6x more rows, so the run takes correspondingly longer.
 - name: invoiceid
   gen:
     type: sequence_string
-    template: "00000000-0000-4000-8000-{}"   # default "{}"
+    template: "inv0000000000000{}"   # default "{}"
     width: 36                                # default 36, a UUID's width
     start: 1                                 # default 1
     step: 1                                  # default 1
@@ -113,20 +113,27 @@ elsewhere.
 ### Where generation time goes
 
 Randomness is not the expensive part. Measured by replacing one generator at a
-time with a constant, 4M rows of `sample.spec` at four generator threads:
+time with a constant, 4M rows of `sample.spec` at four generator threads, best
+of three, against a base of 8022 ms:
 
-| generator | fields | share of generation | per field |
+| generator | fields | cost | note |
 |---|---|---|---|
-| `datetime_around` | 3 | 33% | 963 ms |
-| `decimal_range` | 1 | 12% | 997 ms |
-| `sequence_string` | 3 | 9% | 257 ms |
-| `weighted_choice` | 3 | 5% | 145 ms |
-| `int_range` | 2 | 3% | 127 ms |
+| `datetime_around` | 3 | 2384 ms | 30%, and see the caveat below |
+| `sequence_string` | 3 | 1131 ms | 14%, the zero-padding |
+| `decimal_range` | 1 | 38 ms | 0.5% |
+| `int_range` | 2 | none measurable | under the noise floor |
+| `weighted_choice` | 3 | none measurable | under the noise floor |
 
-`int_range` is the clean measurement of a random draw: `rng.gen_range` into an
-i64, no allocation, no formatting, about 32 ns per row. `StdRng` is ChaCha12 in
-userspace, not a syscall. Everything above it in that table is paying for text,
-not entropy.
+The last two came out marginally *faster* with the generator than with a
+constant, which is how a measurement says "below the noise", here about 1.5%.
+A `weighted_choice` row is a float draw, a scan of a handful of weights, and a
+`String` clone; a `constant` still pays the clone, so there is nothing to see.
+A random draw is around 32 ns: `StdRng` is ChaCha12 in userspace, not a
+syscall. Entropy has never been the thing to optimise here.
+
+That ablation writes CSV, which forces the text rendering the Parquet path
+skips, so it overstates `datetime_around` for real runs. It is the right shape
+for comparing generators against each other, not for costing the pipeline.
 
 So timestamps and decimals do not become text on the way to Parquet. A
 generator emits `Value::Timestamp` (epoch microseconds) or `Value::Decimal`
@@ -136,6 +143,17 @@ strings are built only where something actually needs text: CSV output,
 writer could parse it straight back was costing more than the whole rest of the
 row: on the full Parquet pipeline the change took 4M rows from about 435k to
 about 1.09M rows/s.
+
+Two traps in the other direction. `sequence` is classified `StatefulOrdered`,
+which clamps generation to one thread, so swapping an `int_range` for it to
+"save the random draw" costs about 4x. And `sequence_string` pays for every
+digit it zero-pads: letting a literal prefix carry 16 of a 36-character value,
+so only 20 digits are padded, is worth about 5% on the whole pipeline over
+padding all 36. Twenty digits is also past the u64 counter range, so it cannot
+overflow, while a UUID-shaped template leaves only twelve digits and 40 TB of
+this data is about 1.1e12 rows. A run that would pass that ceiling is refused
+before it starts rather than quietly emitting 37-character values partway
+through.
 
 `datetime_around` also stopped reading the clock per row. It refreshes
 `Utc::now()` every few thousand rows and draws its offset in microseconds
@@ -203,7 +221,7 @@ fields:
   - name: invoiceid
     gen:
       type: sequence_string
-      template: "00000000-0000-4000-8000-{}"
+      template: "inv0000000000000{}"
   - name: xc_cdc_operation
     gen:
       type: weighted_choice
