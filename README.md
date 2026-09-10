@@ -55,6 +55,23 @@ is 244 entries you can edit rather than write. It refuses to overwrite.
 `--emit-s3-config` writes a commented TOML template. Unknown keys are rejected
 at startup, so a typo fails immediately instead of silently taking a default.
 
+## Compression
+
+Parquet compresses internally, per column chunk, before anything is uploaded.
+The bytes on the wire are already compressed, so transport compression on top
+would gain nothing.
+
+`compression_level` sets codec effort: zstd takes 1-22, gzip 0-9. The parquet
+crate defaults zstd to 1, its weakest setting; this tool defaults to 3, which
+is zstd's own default. When the network is the bottleneck, spending CPU here is
+usually free speed because it shrinks what has to be uploaded.
+
+The exception is high-entropy data. On a table dominated by UUIDs and random
+numbers, levels 1 through 12 all produced 358-364 MiB from the same 4M rows,
+a spread under 2%. Parquet dictionary-encodes low-cardinality columns before
+zstd sees them, and random values have nothing left to squeeze. Raising the
+level only pays when the data actually repeats. Measure before tuning.
+
 ## Sizing and limits
 
 `--rows` is exact. `--target-size` is approximate, because a row's compressed
@@ -89,8 +106,16 @@ finished and the workers are completing their files. There is no byte rate on
 the generation line on purpose: bytes do not exist until a row group is
 encoded, so the only honest byte rate is the upload one.
 
+`sent` and `rate` count compressed Parquet bytes, the same bytes that travel
+over the network, so the rate is directly comparable to your link speed.
+`buffered` is different: it is the uncompressed row group held in memory, so
+it describes memory pressure rather than network traffic.
+
 If uploads are the bottleneck, more generator threads will not help. Raise
-`max_concurrent_parts` and `--upload-threads`, or accept the link speed.
+`max_concurrent_parts` and `--upload-threads`, or accept the link speed. The
+queue provides backpressure automatically: when it fills, generators block, so
+generation self-throttles to whatever the network sustains. No rate limiting
+is needed or wanted.
 
 ## Field spec
 

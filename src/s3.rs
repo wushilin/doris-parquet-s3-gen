@@ -79,6 +79,11 @@ pub struct ParquetSection {
     /// zstd, snappy, gzip, lz4, or none.
     #[serde(default = "default_compression")]
     pub compression: String,
+    /// Codec effort. zstd accepts 1-22, gzip 0-9; ignored by the others.
+    /// Higher costs CPU and produces fewer bytes to upload, which is usually
+    /// the right trade when the network is the bottleneck.
+    #[serde(default = "default_compression_level")]
+    pub compression_level: Option<i32>,
     /// Rows per row group. A file can only roll on a row group boundary.
     #[serde(default = "default_row_group_rows")]
     pub row_group_rows: usize,
@@ -102,6 +107,9 @@ fn default_timeout() -> Duration {
 fn default_compression() -> String {
     "zstd".to_string()
 }
+fn default_compression_level() -> Option<i32> {
+    Some(3)
+}
 fn default_row_group_rows() -> usize {
     200_000
 }
@@ -124,6 +132,7 @@ impl Default for ParquetSection {
     fn default() -> Self {
         Self {
             compression: default_compression(),
+            compression_level: default_compression_level(),
             row_group_rows: default_row_group_rows(),
             dictionary: default_true(),
         }
@@ -218,6 +227,23 @@ impl OutputConfig {
                 CODECS.join(", ")
             );
         }
+        if let Some(level) = self.parquet.compression_level {
+            let range = match codec.as_str() {
+                "zstd" => Some((1, 22)),
+                "gzip" => Some((0, 9)),
+                _ => None,
+            };
+            match range {
+                Some((low, high)) if level < low || level > high => bail!(
+                    "parquet.compression_level {} is outside the {} range of {}..={}",
+                    level,
+                    codec,
+                    low,
+                    high
+                ),
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -311,6 +337,12 @@ timeout = "60s"
 # zstd, snappy, gzip, lz4, lz4_raw, or none. Doris reads all of these.
 compression = "zstd"
 
+# Codec effort: zstd 1-22, gzip 0-9. When the network is the bottleneck,
+# spending CPU here is free speed, because it shrinks what has to be uploaded.
+# Level 1 is the parquet crate's default and compresses poorly; 3 is zstd's
+# own default. Try 6 or 9 on a slow link.
+compression_level = 3
+
 # Rows per row group. Each upload worker buffers a whole row group in memory
 # before encoding it, so this multiplied by the worker count drives peak
 # memory. It also sets how finely file sizes and size targets can be tracked.
@@ -336,6 +368,7 @@ mod tests {
         assert_eq!(config.upload.part_size, 10 << 20);
         assert_eq!(config.upload.max_concurrent_parts, 8);
         assert_eq!(config.parquet.compression, "zstd");
+        assert_eq!(config.parquet.compression_level, Some(3));
         assert_eq!(config.upload.timeout, Duration::from_secs(60));
         assert_eq!(config.buffer_bytes_per_thread(), 80 << 20);
         // 10MiB x 10000 parts, which is about 97GiB rather than a round 100GiB.
@@ -430,5 +463,22 @@ mod tests {
         let credentials = config.s3.credentials.expect("credentials present");
         assert_eq!(credentials.access_key_id, "A");
         assert_eq!(credentials.session_token, None);
+    }
+
+    #[test]
+    fn validates_compression_level_against_the_codec() {
+        let ok = parse("[s3]\nbucket=\"b\"\nregion=\"r\"\n[parquet]\ncompression=\"zstd\"\ncompression_level=19\n");
+        assert!(ok.is_ok(), "zstd accepts 19");
+
+        let too_high = parse("[s3]\nbucket=\"b\"\nregion=\"r\"\n[parquet]\ncompression=\"zstd\"\ncompression_level=23\n")
+            .expect_err("zstd stops at 22");
+        assert!(too_high.to_string().contains("1..=22"), "{}", too_high);
+
+        let gzip_range = parse("[s3]\nbucket=\"b\"\nregion=\"r\"\n[parquet]\ncompression=\"gzip\"\ncompression_level=12\n")
+            .expect_err("gzip stops at 9");
+        assert!(gzip_range.to_string().contains("0..=9"), "{}", gzip_range);
+
+        // Codecs without a level simply ignore it.
+        assert!(parse("[s3]\nbucket=\"b\"\nregion=\"r\"\n[parquet]\ncompression=\"snappy\"\ncompression_level=5\n").is_ok());
     }
 }

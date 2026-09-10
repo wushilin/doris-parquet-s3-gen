@@ -129,6 +129,10 @@ struct Args {
     #[arg(long, conflicts_with = "s3_config", value_name = "DIR")]
     out_dir: Option<PathBuf>,
 
+    /// zstd level for --out-dir runs. Range 1-22; higher trades CPU for size.
+    #[arg(long, value_name = "N")]
+    compression_level: Option<i32>,
+
     /// Suppress the live status display.
     #[arg(long)]
     no_progress: bool,
@@ -1365,7 +1369,7 @@ async fn run_parquet(
             config.upload.part_size as usize,
             config.upload.max_concurrent_parts,
             config.parquet.row_group_rows,
-            sink::parse_compression(&config.parquet.compression)?,
+            sink::parse_compression(&config.parquet.compression, config.parquet.compression_level)?,
             config.parquet.dictionary,
         ),
         None => (
@@ -1375,7 +1379,7 @@ async fn run_parquet(
             10 << 20,
             8,
             200_000,
-            sink::parse_compression("zstd")?,
+            sink::parse_compression("zstd", args.compression_level)?,
             true,
         ),
     };

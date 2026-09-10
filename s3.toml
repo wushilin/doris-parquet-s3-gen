@@ -21,5 +21,6 @@ timeout = "60s"
 
 [parquet]
 compression = "zstd"
+compression_level = 3
 row_group_rows = 200000
 dictionary = true

@@ -86,11 +86,19 @@ impl SinkSettings {
     }
 }
 
-pub fn parse_compression(name: &str) -> Result<Compression> {
+/// `level` is the codec effort; `None` uses the codec's own default.
+/// Note the parquet crate defaults zstd to level 1, its weakest setting.
+pub fn parse_compression(name: &str, level: Option<i32>) -> Result<Compression> {
     let codec = match name.to_ascii_lowercase().as_str() {
-        "zstd" => Compression::ZSTD(ZstdLevel::default()),
+        "zstd" => Compression::ZSTD(match level {
+            Some(level) => ZstdLevel::try_new(level)?,
+            None => ZstdLevel::default(),
+        }),
         "snappy" => Compression::SNAPPY,
-        "gzip" => Compression::GZIP(Default::default()),
+        "gzip" => Compression::GZIP(match level {
+            Some(level) => parquet::basic::GzipLevel::try_new(level as u32)?,
+            None => Default::default(),
+        }),
         "lz4" => Compression::LZ4,
         "lz4_raw" => Compression::LZ4_RAW,
         "none" | "uncompressed" => Compression::UNCOMPRESSED,
@@ -350,13 +358,20 @@ mod tests {
 
     #[test]
     fn maps_compression_names() {
-        assert!(matches!(parse_compression("zstd").unwrap(), Compression::ZSTD(_)));
-        assert!(matches!(parse_compression("SNAPPY").unwrap(), Compression::SNAPPY));
+        assert!(matches!(parse_compression("zstd", None).unwrap(), Compression::ZSTD(_)));
+        assert!(matches!(parse_compression("SNAPPY", None).unwrap(), Compression::SNAPPY));
         assert!(matches!(
-            parse_compression("none").unwrap(),
+            parse_compression("none", None).unwrap(),
             Compression::UNCOMPRESSED
         ));
-        assert!(parse_compression("brotli").is_err());
+        assert!(parse_compression("brotli", None).is_err());
+
+        // The level must reach the codec, not be silently dropped.
+        let Compression::ZSTD(level) = parse_compression("zstd", Some(9)).unwrap() else {
+            panic!("expected zstd");
+        };
+        assert_eq!(level.compression_level(), 9);
+        assert!(parse_compression("zstd", Some(99)).is_err());
     }
 
     #[tokio::test]
