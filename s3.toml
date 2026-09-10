@@ -1,0 +1,25 @@
+# S3 target for generated Parquet files.
+# Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
+# environment, so no [s3.credentials] section is needed here.
+
+[s3]
+bucket = "wushilin-singapore"
+prefix = "datagen/dbo_invoiceevent_state/"
+region = "ap-southeast-1"
+
+[upload]
+# Each part is buffered in memory before it is sent. S3 allows at most
+# 10000 parts per object, so 10MiB parts cap a single file at about 97GiB.
+part_size = "10MiB"
+
+# Parts in flight per file. Peak upload buffer per writer thread is
+# part_size x max_concurrent_parts = 80MiB.
+max_concurrent_parts = 8
+
+retries = 3
+timeout = "60s"
+
+[parquet]
+compression = "zstd"
+row_group_rows = 200000
+dictionary = true

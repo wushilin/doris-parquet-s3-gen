@@ -1,0 +1,7 @@
+/target
+*.parquet
+*.csv
+# Local S3 configs may name real buckets or hold credentials.
+*.local.toml
+.DS_Store
+.*.swp
