@@ -118,6 +118,14 @@ pub fn build_store(destination: &Destination) -> Result<(Arc<dyn ObjectStore>, S
                 builder = builder.with_region(region);
             }
             if let Some(endpoint) = &config.s3.endpoint {
+                // object_store never rewrites the host: with virtual-hosted
+                // style it uses the endpoint verbatim and appends the key, so
+                // an endpoint without the bucket addresses the wrong object.
+                let endpoint = if config.s3.path_style {
+                    endpoint.clone()
+                } else {
+                    virtual_hosted_endpoint(endpoint, &config.s3.bucket)
+                };
                 builder = builder.with_endpoint(endpoint);
             }
             if config.s3.allow_http {
@@ -153,6 +161,24 @@ pub fn build_store(destination: &Destination) -> Result<(Arc<dyn ObjectStore>, S
             Ok((Arc::new(store), String::new()))
         }
     }
+}
+
+/// Put the bucket in front of the endpoint host, the way virtual-hosted
+/// addressing wants it: `https://oss-cn-beijing.aliyuncs.com` with bucket
+/// `zyk-bj` becomes `https://zyk-bj.oss-cn-beijing.aliyuncs.com`. An endpoint
+/// that already names the bucket is left alone, so both spellings work.
+fn virtual_hosted_endpoint(endpoint: &str, bucket: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some(split) => split,
+        // Validation in s3.rs rejects a scheme-less endpoint, so this only
+        // guards against a caller that skipped it.
+        None => return trimmed.to_string(),
+    };
+    if rest.starts_with(&format!("{}.", bucket)) {
+        return trimmed.to_string();
+    }
+    format!("{}://{}.{}", scheme, bucket, rest)
 }
 
 /// Move a shared gauge by the difference, tracking what this writer reported.
@@ -341,6 +367,26 @@ impl ParquetSink {
 
 #[cfg(test)]
 mod tests {
+    use super::virtual_hosted_endpoint;
+
+    #[test]
+    fn puts_the_bucket_in_the_endpoint_host() {
+        assert_eq!(
+            virtual_hosted_endpoint("https://oss-cn-beijing-internal.aliyuncs.com", "zyk-bj"),
+            "https://zyk-bj.oss-cn-beijing-internal.aliyuncs.com"
+        );
+        // A trailing slash must not end up inside the host.
+        assert_eq!(
+            virtual_hosted_endpoint("https://oss-cn-beijing.aliyuncs.com/", "zyk-bj"),
+            "https://zyk-bj.oss-cn-beijing.aliyuncs.com"
+        );
+        // Already spelled out, so leave it alone rather than double it up.
+        assert_eq!(
+            virtual_hosted_endpoint("https://zyk-bj.oss-cn-beijing.aliyuncs.com", "zyk-bj"),
+            "https://zyk-bj.oss-cn-beijing.aliyuncs.com"
+        );
+    }
+
     use super::*;
     use crate::parquet_out::BatchBuilder;
     use crate::schema::parse_schema;
