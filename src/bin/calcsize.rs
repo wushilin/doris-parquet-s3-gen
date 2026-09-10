@@ -8,8 +8,12 @@
 //! because `ListMultipartUploads` and `AbortMultipartUpload` are not part of
 //! the `ObjectStore` trait. Only the config parsing is shared.
 
+// The config struct describes the generator's whole S3 setup; this binary
+// reads only the parts it needs to reach the bucket.
+#[allow(dead_code)]
 #[path = "../s3.rs"]
 mod s3;
+#[allow(dead_code)]
 #[path = "../units.rs"]
 mod units;
 
@@ -55,8 +59,15 @@ struct Args {
     abort_older_than: i64,
 
     /// Report stale multipart uploads without aborting any.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "force_abort")]
     no_abort: bool,
+
+    /// Abort every multipart upload under the prefix regardless of age, for
+    /// clearing up immediately after a run rather than waiting out the age
+    /// cutoff. This will kill uploads a running generator still has in flight,
+    /// so do not point it at a prefix something is still writing to.
+    #[arg(long)]
+    force_abort: bool,
 }
 
 #[derive(Default)]
@@ -298,7 +309,7 @@ async fn main() -> Result<()> {
     let cutoff = ChronoDuration::days(args.abort_older_than.max(0));
     let (stale, fresh): (Vec<_>, Vec<_>) = uploads
         .into_iter()
-        .partition(|(_, _, initiated)| now - *initiated > cutoff);
+        .partition(|(_, _, initiated)| args.force_abort || now - *initiated > cutoff);
 
     let days = args.abort_older_than;
     if args.no_abort {
@@ -331,14 +342,21 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!(
-        "\nalso cleared {} multipart uploads older than {} days. \
-         Left {} multipart uploads intact within {} days.",
-        group_digits(cleared),
-        days,
-        group_digits(fresh.len() as u64),
-        days
-    );
+    if args.force_abort {
+        println!(
+            "\nalso cleared {} multipart uploads of any age (--force-abort).",
+            group_digits(cleared)
+        );
+    } else {
+        println!(
+            "\nalso cleared {} multipart uploads older than {} days. \
+             Left {} multipart uploads intact within {} days.",
+            group_digits(cleared),
+            days,
+            group_digits(fresh.len() as u64),
+            days
+        );
+    }
     if failed > 0 {
         println!(
             "{} could not be aborted; they are left for the bucket's lifecycle rule.",
