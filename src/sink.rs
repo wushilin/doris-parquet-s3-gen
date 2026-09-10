@@ -123,9 +123,11 @@ pub fn build_store(destination: &Destination) -> Result<(Arc<dyn ObjectStore>, S
             if config.s3.allow_http {
                 builder = builder.with_allow_http(true);
             }
-            if config.s3.path_style {
-                builder = builder.with_virtual_hosted_style_request(false);
-            }
+            // Always set this explicitly. object_store defaults to path style,
+            // so only ever passing `false` left virtual-hosted style
+            // unreachable, which S3-compatible services such as Alibaba OSS
+            // require.
+            builder = builder.with_virtual_hosted_style_request(!config.s3.path_style);
             if let Some(credentials) = &config.s3.credentials {
                 builder = builder
                     .with_access_key_id(&credentials.access_key_id)

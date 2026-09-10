@@ -39,7 +39,9 @@ pub struct S3Section {
     /// Set for MinIO, Ceph, or any S3-compatible endpoint.
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// Path-style addressing. Required by most S3-compatible servers.
+    /// Path-style addressing (`endpoint/bucket/key`). MinIO and Ceph want
+    /// this. Leave it off for AWS and for Alibaba OSS, which both address
+    /// buckets as a subdomain (`bucket.endpoint/key`).
     #[serde(default)]
     pub path_style: bool,
     /// Permit a plain-HTTP endpoint. Off by default.
@@ -303,10 +305,16 @@ prefix = "doris/u347ug_data/"
 # Region for real AWS S3.
 region = "ap-southeast-1"
 
-# For MinIO, Ceph, or any S3-compatible server, set endpoint instead.
-# Most of them need path-style addressing.
+# For any S3-compatible server, set endpoint instead of relying on region.
+# MinIO and Ceph address buckets by path; Alibaba OSS uses a subdomain, so
+# leave path_style off there.
 # endpoint = "https://minio.internal:9000"
 # path_style = true
+#
+# Alibaba OSS, Beijing:
+# endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"   # from inside ECS
+# endpoint = "https://oss-cn-beijing.aliyuncs.com"            # from outside
+# region = "cn-beijing"
 
 # Plain-HTTP endpoints are refused unless this is set.
 # allow_http = false
