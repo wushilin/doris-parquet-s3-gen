@@ -42,7 +42,8 @@ Options:
   -n, --dry-run         print the command and exit
   -h, --help            this text
 
-Sizes accept K/M/G with optional i and B, for example 512M, 2GiB, 1GB.
+Sizes accept K/M/G/T/P with optional i and B, for example 512M, 2GiB, 40TiB.
+Every unit is a power of 1024, so GB and GiB mean the same thing.
 USAGE
 }
 

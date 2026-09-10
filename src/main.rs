@@ -2812,6 +2812,10 @@ fn parse_byte_size(value: &str) -> std::result::Result<u64, String> {
         "k" | "kb" | "kib" => 1024.0,
         "m" | "mb" | "mib" => 1024.0 * 1024.0,
         "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        // A tool whose job is multi-terabyte datasets should be able to say
+        // so without counting gibibytes.
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "p" | "pb" | "pib" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
         other => return Err(format!("unknown byte unit '{other}' in '{value}'")),
     };
     let bytes = (num * multiplier).ceil();
@@ -3780,9 +3784,25 @@ mod tests {
             (23.3f64 * 1024.0).ceil() as u64
         );
         assert_eq!(parse_byte_size("233KiB").unwrap(), 233 * 1024);
+        assert_eq!(parse_byte_size("1T").unwrap(), 1024u64.pow(4));
+        assert_eq!(parse_byte_size("1TB").unwrap(), 1024u64.pow(4));
+        assert_eq!(parse_byte_size("1TiB").unwrap(), 1024u64.pow(4));
+        assert_eq!(parse_byte_size("40TiB").unwrap(), 40 * 1024u64.pow(4));
+        // 40TiB and 40960GiB have to be the same number of bytes.
+        assert_eq!(
+            parse_byte_size("40TiB").unwrap(),
+            parse_byte_size("40960GiB").unwrap()
+        );
+        assert_eq!(parse_byte_size("1P").unwrap(), 1024u64.pow(5));
+        // Every unit here is a power of 1024, so the B spellings are aliases
+        // rather than the decimal units they look like.
+        assert_eq!(
+            parse_byte_size("1TB").unwrap(),
+            parse_byte_size("1TiB").unwrap()
+        );
         assert!(parse_byte_size("abc").is_err());
         assert!(parse_byte_size("-1").is_err());
-        assert!(parse_byte_size("1TB").is_err());
+        assert!(parse_byte_size("1XB").is_err());
     }
 
     #[test]
