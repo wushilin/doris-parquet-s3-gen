@@ -72,6 +72,44 @@ a spread under 2%. Parquet dictionary-encodes low-cardinality columns before
 zstd sees them, and random values have nothing left to squeeze. Raising the
 level only pays when the data actually repeats. Measure before tuning.
 
+### Unique ids: `sequence_string` vs `uuid`
+
+`uuid` emits a real v4 UUID, so values are unpredictable and independent
+between runs. Generating one is cheaper than it looks: on `sample.spec`, which
+has three UUID columns per row, swapping all three for counters moved the full
+pipeline from roughly 395k to 435k rows/s at four generator threads. Worth
+having, but UUID generation is not the bottleneck anyone expects it to be.
+
+The size difference is the part that matters. The same 4M rows are 358 MiB of
+Parquet with `uuid` and 139 MiB with `sequence_string`, because dense ordered
+strings compress and random ones do not. On an upload-bound run that is 2.6x
+less to push. On a `--target-size` run it cuts the other way: the same byte
+budget now holds 2.6x more rows, so the run takes correspondingly longer.
+
+`sequence_string` renders a counter into a fixed-width string instead:
+
+```yaml
+- name: invoiceid
+  gen:
+    type: sequence_string
+    template: "00000000-0000-4000-8000-{}"   # default "{}"
+    width: 36                                # default 36, a UUID's width
+    start: 1                                 # default 1
+    step: 1                                  # default 1
+```
+
+The counter is zero-padded to fill whatever the literal text leaves over, so
+the output is always `width` characters and column widths and file sizes stay
+where they were. All generator threads share one cursor and claim blocks of it,
+so values are unique across threads; the atomic is touched once per block, not
+once per row.
+
+Reach for `uuid` when the test depends on values being random or unguessable,
+or when you are measuring compression, compaction, or write amplification and
+need the pessimistic case. Reach for `sequence_string` when a column only needs
+to be unique and the right size, and you would rather spend the bytes
+elsewhere.
+
 ## Sizing and limits
 
 `--rows` is exact. `--target-size` is approximate, because a row's compressed
@@ -120,17 +158,19 @@ is needed or wanted.
 ## Field spec
 
 The spec is YAML. Each field names a generator; fields can reference each other
-and are ordered by a dependency graph. Generators include `uuid`, `sequence`,
-`int_range`, `float_range`, `decimal_range`, `datetime_around`,
-`datetime_range`, `choice`, `weighted_choice`, `template`, `lorem`, `name`,
-`email`, `address`, `random_bytes`, `fluctuating`, and `javascript`.
+and are ordered by a dependency graph. Generators include `uuid`,
+`sequence_string`, `sequence`, `int_range`, `float_range`, `decimal_range`,
+`datetime_around`, `datetime_range`, `choice`, `weighted_choice`, `template`,
+`lorem`, `name`, `email`, `address`, `random_bytes`, `fluctuating`, and
+`javascript`.
 
 ```yaml
 version: 1
 fields:
   - name: invoiceid
     gen:
-      type: uuid
+      type: sequence_string
+      template: "00000000-0000-4000-8000-{}"
   - name: xc_cdc_operation
     gen:
       type: weighted_choice

@@ -220,6 +220,7 @@ struct FieldSpec {
 enum GeneratorSpec {
     Constant(ConstantSpec),
     Sequence(SequenceSpec),
+    SequenceString(SequenceStringSpec),
     Name(NameSpec),
     Email(EmailSpec),
     Lorem(LoremSpec),
@@ -254,6 +255,23 @@ struct SequenceSpec {
     start: i64,
     #[serde(default = "default_sequence_step")]
     step: i64,
+    #[serde(default)]
+    null_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SequenceStringSpec {
+    /// Literal text with one `{}` where the counter goes.
+    #[serde(default = "default_sequence_string_template")]
+    template: String,
+    #[serde(default = "default_sequence_string_start")]
+    start: u64,
+    #[serde(default = "default_sequence_string_step")]
+    step: u64,
+    /// Total width of the rendered value. The counter is zero-padded to fill
+    /// whatever the literal text leaves over.
+    #[serde(default = "default_sequence_string_width")]
+    width: usize,
     #[serde(default)]
     null_rate: Option<f64>,
 }
@@ -535,6 +553,7 @@ enum GeneratorKind {
 enum Generator {
     Constant(ConstantGenerator),
     Sequence(SequenceGenerator),
+    SequenceString(SequenceStringGenerator),
     Name(NameGenerator),
     Email(EmailGenerator),
     Lorem(LoremGenerator),
@@ -556,6 +575,10 @@ enum Generator {
 impl Generator {
     fn kind(&self) -> GeneratorKind {
         match self {
+            // `sequence_string` is deliberately absent: it carries state, but
+            // its counter is shared and claimed in blocks, so producers stay
+            // independent. Listing it here would clamp generation to one
+            // thread and cost far more than the UUIDs it replaces.
             Generator::Sequence(_) | Generator::Fluctuating(_) | Generator::JavaScript(_) => {
                 GeneratorKind::StatefulOrdered
             }
@@ -575,6 +598,7 @@ impl Generator {
         match self {
             Generator::Constant(generator) => generator.generate(ctx, rng),
             Generator::Sequence(generator) => generator.generate(ctx, rng),
+            Generator::SequenceString(generator) => generator.generate(ctx, rng),
             Generator::Name(generator) => generator.generate(ctx, rng),
             Generator::Email(generator) => generator.generate(ctx, rng),
             Generator::Lorem(generator) => generator.generate(ctx, rng),
@@ -629,6 +653,84 @@ impl FieldGenerator for SequenceGenerator {
         let value = self.next;
         self.next = self.next.saturating_add(self.step);
         Ok(Value::I64(value))
+    }
+}
+
+/// How many counter values a generator claims from the shared cursor at once.
+/// Claiming in blocks keeps the atomic off the per-row path, so the cost per
+/// row is a compare and an add.
+const SEQUENCE_STRING_BLOCK: u64 = 1 << 16;
+
+/// A counter rendered into a fixed-width string, as a cheap stand-in for
+/// `uuid` when a column only needs to be unique and the right size. Producing
+/// a v4 UUID costs a draw from the OS entropy pool per value; this costs an
+/// increment and a format.
+///
+/// Every clone shares one cursor and claims its own block of the counter, so
+/// values stay unique across generator threads. That is what a key column
+/// needs, and it is why this is not simply `sequence` with a format applied.
+struct SequenceStringGenerator {
+    /// Literal text before and after the counter, split from the template.
+    prefix: String,
+    suffix: String,
+    /// Zero-padding width for the counter, so the whole value hits `width`.
+    digits: usize,
+    start: u64,
+    step: u64,
+    /// Next unclaimed index, shared by every clone of this generator.
+    cursor: Arc<AtomicU64>,
+    /// The half-open block of indices this instance still owns.
+    next_index: u64,
+    block_end: u64,
+    null_rate: Option<f64>,
+}
+
+/// Cloning hands the copy an empty block so it claims indices of its own
+/// rather than replaying the ones this instance is partway through.
+impl Clone for SequenceStringGenerator {
+    fn clone(&self) -> Self {
+        Self {
+            prefix: self.prefix.clone(),
+            suffix: self.suffix.clone(),
+            digits: self.digits,
+            start: self.start,
+            step: self.step,
+            cursor: self.cursor.clone(),
+            next_index: 0,
+            block_end: 0,
+            null_rate: self.null_rate,
+        }
+    }
+}
+
+impl SequenceStringGenerator {
+    fn claim_block(&mut self) {
+        let first = self
+            .cursor
+            .fetch_add(SEQUENCE_STRING_BLOCK, Ordering::Relaxed);
+        self.next_index = first;
+        self.block_end = first.saturating_add(SEQUENCE_STRING_BLOCK);
+    }
+}
+
+impl FieldGenerator for SequenceStringGenerator {
+    fn generate(&mut self, _ctx: &RowContext, rng: &mut StdRng) -> Result<Value> {
+        if should_emit_null(self.null_rate, rng)? {
+            return Ok(Value::Null);
+        }
+        if self.next_index >= self.block_end {
+            self.claim_block();
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+        let counter = self.start.saturating_add(index.saturating_mul(self.step));
+        Ok(Value::String(format!(
+            "{}{:0width$}{}",
+            self.prefix,
+            counter,
+            self.suffix,
+            width = self.digits
+        )))
     }
 }
 
@@ -2081,6 +2183,33 @@ fn compile_generator(spec: GeneratorSpec) -> Result<Generator> {
             step: spec.step,
             null_rate: spec.null_rate,
         }),
+        GeneratorSpec::SequenceString(spec) => {
+            let (prefix, suffix) = split_sequence_template(&spec.template)?;
+            let literal = prefix.len() + suffix.len();
+            if literal > spec.width {
+                bail!(
+                    "sequence_string template `{}` has {} literal characters, \
+                     which does not fit width {}",
+                    spec.template,
+                    literal,
+                    spec.width
+                );
+            }
+            if spec.step == 0 {
+                bail!("sequence_string step must be at least 1");
+            }
+            Generator::SequenceString(SequenceStringGenerator {
+                prefix,
+                suffix,
+                digits: spec.width - literal,
+                start: spec.start,
+                step: spec.step,
+                cursor: Arc::new(AtomicU64::new(0)),
+                next_index: 0,
+                block_end: 0,
+                null_rate: spec.null_rate,
+            })
+        }
         GeneratorSpec::Name(spec) => Generator::Name(NameGenerator {
             part: spec.part,
             null_rate: spec.null_rate,
@@ -2610,6 +2739,38 @@ fn default_sequence_step() -> i64 {
     1
 }
 
+fn default_sequence_string_template() -> String {
+    "{}".to_string()
+}
+
+fn default_sequence_string_start() -> u64 {
+    1
+}
+
+fn default_sequence_string_step() -> u64 {
+    1
+}
+
+/// 36 characters, the width of a hyphenated UUID, so swapping `uuid` for
+/// `sequence_string` leaves column widths and file sizes where they were.
+fn default_sequence_string_width() -> usize {
+    36
+}
+
+/// Split `prefix{}suffix` into its two literal halves.
+fn split_sequence_template(template: &str) -> Result<(String, String)> {
+    let (prefix, rest) = template
+        .split_once("{}")
+        .ok_or_else(|| anyhow!("sequence_string template `{}` needs a `{{}}` placeholder", template))?;
+    if rest.contains("{}") {
+        bail!(
+            "sequence_string template `{}` has more than one `{{}}` placeholder",
+            template
+        );
+    }
+    Ok((prefix.to_string(), rest.to_string()))
+}
+
 fn default_name_part() -> NamePart {
     NamePart::Full
 }
@@ -3054,6 +3215,95 @@ mod tests {
     fn compile_yaml(yaml: &str) -> Result<CompiledSpec> {
         let raw = serde_yaml::from_str::<RawSpec>(yaml)?;
         compile_spec(raw)
+    }
+
+    /// Pull `count` values out of one generator instance.
+    fn take_values(generator: &mut Generator, count: usize) -> Vec<String> {
+        let mut rng = StdRng::seed_from_u64(7);
+        let ctx = RowContext::new();
+        (0..count)
+            .map(|_| match generator.generate(&ctx, &mut rng).unwrap() {
+                Value::String(value) => value,
+                other => panic!("expected a string, got {:?}", other),
+            })
+            .collect()
+    }
+
+    fn compile_sequence_string(yaml: &str) -> Result<Generator> {
+        let spec = serde_yaml::from_str::<GeneratorSpec>(yaml)?;
+        compile_generator(spec)
+    }
+
+    /// `Generator` is not `Debug`, so `expect_err` is not available here.
+    fn compile_sequence_string_err(yaml: &str, why: &str) -> anyhow::Error {
+        match compile_sequence_string(yaml) {
+            Ok(_) => panic!("expected a failure: {}", why),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn sequence_string_pads_to_the_configured_width() {
+        let mut generator = compile_sequence_string("type: sequence_string\n").unwrap();
+        let values = take_values(&mut generator, 3);
+        assert_eq!(values[0].len(), 36, "{}", values[0]);
+        assert_eq!(values[0], "0".repeat(35) + "1");
+        assert_eq!(values[2], "0".repeat(35) + "3");
+    }
+
+    #[test]
+    fn sequence_string_fills_a_template_to_uuid_shape() {
+        let mut generator = compile_sequence_string(
+            "type: sequence_string\ntemplate: \"00000000-0000-4000-8000-{}\"\n",
+        )
+        .unwrap();
+        let values = take_values(&mut generator, 2);
+        assert_eq!(values[0], "00000000-0000-4000-8000-000000000001");
+        assert_eq!(values[1], "00000000-0000-4000-8000-000000000002");
+        assert!(values.iter().all(|value| value.len() == 36));
+    }
+
+    #[test]
+    fn sequence_string_honours_start_and_step() {
+        let mut generator =
+            compile_sequence_string("type: sequence_string\nstart: 10\nstep: 5\nwidth: 4\n")
+                .unwrap();
+        assert_eq!(take_values(&mut generator, 3), vec!["0010", "0015", "0020"]);
+    }
+
+    /// The point of the shared cursor: clones are what the generator threads
+    /// get, and a key column cannot afford them repeating each other.
+    #[test]
+    fn sequence_string_clones_do_not_collide() {
+        let generator = compile_sequence_string("type: sequence_string\n").unwrap();
+        let mut first = generator.clone();
+        let mut second = generator.clone();
+        // More than one block each, so the refill path is covered too.
+        let count = (SEQUENCE_STRING_BLOCK as usize) + 100;
+        let mut seen: HashSet<String> = take_values(&mut first, count).into_iter().collect();
+        for value in take_values(&mut second, count) {
+            assert!(seen.insert(value.clone()), "duplicate value {}", value);
+        }
+        assert_eq!(seen.len(), count * 2);
+    }
+
+    #[test]
+    fn sequence_string_rejects_a_template_that_does_not_fit() {
+        let too_wide = compile_sequence_string_err(
+            "type: sequence_string\ntemplate: \"invoice-{}\"\nwidth: 4\n",
+            "literal text is wider than the width",
+        );
+        assert!(too_wide.to_string().contains("does not fit"), "{}", too_wide);
+
+        let no_placeholder = compile_sequence_string_err(
+            "type: sequence_string\ntemplate: \"invoice\"\n",
+            "no placeholder",
+        );
+        assert!(
+            no_placeholder.to_string().contains("placeholder"),
+            "{}",
+            no_placeholder
+        );
     }
 
     fn generate_one_row(spec: &CompiledSpec) -> Result<RowContext> {

@@ -10,12 +10,16 @@ batch:
   rows: 1000
 
 fields:
-  # 128-bit random UUID, rendered as the standard 36-character hyphenated form.
-  # Fits varchar(256) with room to spare.
+  # Unique 36-character key, UUID-shaped so it still fits varchar(256) and
+  # still costs 36 bytes per row. A counter rather than `type: uuid` because
+  # dense strings compress: the three id columns here are the difference
+  # between 358 MiB and 139 MiB of Parquet per 4M rows. Switch back to
+  # `type: uuid` when the point of the run is random, incompressible data.
   - name: invoiceid
     order: 0
     gen:
-      type: uuid
+      type: sequence_string
+      template: "00000000-0000-4000-8000-{}"
 
   # Partition key: AUTO PARTITION BY RANGE(date_trunc(eventdate, 'week')).
   # A 30-day window produces about five weekly partitions.
@@ -28,17 +32,19 @@ fields:
       format: "%Y-%m-%d %H:%M:%S%.6f"
 
   # Distribution key: DISTRIBUTED BY HASH(organisationid) BUCKETS 8.
-  # A fresh UUID per row spreads buckets perfectly but means every row is a
+  # A fresh value per row spreads buckets perfectly but means every row is a
   # different organisation. See the notes on tenant skew below.
   - name: organisationid
     order: 2
     gen:
-      type: uuid
+      type: sequence_string
+      template: "00000000-0000-4000-9000-{}"
 
   - name: eventid
     order: 3
     gen:
-      type: uuid
+      type: sequence_string
+      template: "00000000-0000-4000-a000-{}"
 
   # CDC operation. Both values are exactly 6 characters, which is the full
   # width of varchar(6), so no other verb fits without widening the column.
