@@ -39,6 +39,12 @@ pub struct S3Section {
     /// Set for MinIO, Ceph, or any S3-compatible endpoint.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Tags this run's objects so a second run into the same prefix adds to
+    /// the dataset instead of overwriting it. Defaults to a UTC timestamp with
+    /// a short random suffix; set it to pin the names, or to "" for the older
+    /// naming with no run segment.
+    #[serde(default)]
+    pub run_id: Option<String>,
     /// Path-style addressing (`endpoint/bucket/key`). MinIO and Ceph want
     /// this. Leave it off for AWS and for Alibaba OSS, which both address
     /// buckets as a subdomain (`bucket.endpoint/key`).
@@ -347,6 +353,12 @@ region = "ap-southeast-1"
 # endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"   # from inside ECS
 # endpoint = "https://oss-cn-beijing.aliyuncs.com"            # from outside
 # region = "cn-beijing"
+
+# Objects are named <prefix>part-<run_id>-w<writer>-<index>.parquet. The run
+# id defaults to a UTC timestamp with a random suffix, so restarting a run adds
+# to the prefix rather than overwriting what the last one wrote. Pin it to make
+# names reproducible, or set it to "" for the older names with no run segment.
+# run_id = "run01"
 
 # Plain-HTTP endpoints are refused unless this is set.
 # allow_http = false

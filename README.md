@@ -174,6 +174,29 @@ rather than seconds, which keeps the sub-second digits as varied as they were
 when every row called the clock. That matters more than it looks: a datetime
 column that quietly became compressible would change what a load test measures.
 
+## Object names
+
+```
+<prefix>part-<run_id>-w<writer>-<index>.parquet
+datagen/invoiceevent/part-20260910T143803Z-79ee76-w03-000042.parquet
+```
+
+The writer id keeps concurrent writers apart and the index orders one writer's
+files. Both pad rather than truncate, so more writers or more files than the
+padding expects still produce distinct names.
+
+The run id is the one that matters for a long job. Without it every run starts
+its numbering at one again, so a second run into the same prefix overwrites the
+first: a restart after a failure would destroy what had already been written
+rather than adding to it. It defaults to a UTC timestamp plus a short random
+suffix, because two generators started against the same prefix in the same
+second is exactly how a large run gets split across machines.
+
+```toml
+[s3]
+run_id = "run01"   # pin it, or "" for the older names with no run segment
+```
+
 ## Surviving a long run
 
 A run measured in days will meet a storage service having a bad minute. Three

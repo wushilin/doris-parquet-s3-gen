@@ -1691,7 +1691,13 @@ async fn run_parquet(
 
     let columns = table.columns.clone();
     let schema_ref = parquet_out::arrow_schema(&columns)?;
+    // One id for the whole run, shared by every writer through the settings.
+    let run_id = match s3_config.as_ref().and_then(|config| config.s3.run_id.clone()) {
+        Some(pinned) => pinned,
+        None => default_run_id(),
+    };
     let settings = Arc::new(sink::SinkSettings {
+        run_id,
         schema: schema_ref,
         row_group_rows,
         part_size,
@@ -2792,6 +2798,19 @@ fn is_identifier(value: &str) -> bool {
     };
     (first == '_' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// A UTC timestamp plus a few random characters. The timestamp alone would
+/// collide between two generators started against the same prefix in the same
+/// second, which is exactly how a large run gets split across machines.
+fn default_run_id() -> String {
+    let mut suffix = [0u8; 3];
+    rand::thread_rng().fill_bytes(&mut suffix);
+    format!(
+        "{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%SZ"),
+        hex_encode(&suffix)
+    )
 }
 
 fn parse_byte_size(value: &str) -> std::result::Result<u64, String> {

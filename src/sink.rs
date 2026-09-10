@@ -66,6 +66,11 @@ pub enum Destination {
 }
 
 pub struct SinkSettings {
+    /// Distinguishes one run's objects from another's in the same prefix.
+    /// Without it every run starts its file numbering at one again and
+    /// overwrites the last run's output, which is a bad way to discover that a
+    /// restart does not resume. Empty keeps the older, shorter names.
+    pub run_id: String,
     pub schema: SchemaRef,
     pub row_group_rows: usize,
     pub part_size: usize,
@@ -80,6 +85,7 @@ impl SinkSettings {
     #[cfg(test)]
     fn clone_for_test(&self) -> Self {
         Self {
+            run_id: self.run_id.clone(),
             schema: self.schema.clone(),
             row_group_rows: self.row_group_rows,
             part_size: self.part_size,
@@ -265,11 +271,23 @@ impl ParquetSink {
         }
     }
 
+    /// `<prefix>part-<run>-w<writer>-<index>.parquet`, or without the run
+    /// segment when no run id is set. The writer id keeps concurrent writers
+    /// from colliding and the index orders one writer's files; both pad rather
+    /// than truncate, so a run wider or longer than the padding still produces
+    /// distinct names.
     fn next_path(&mut self) -> String {
         self.file_index += 1;
         format!(
-            "{}part-w{:02}-{:06}.parquet",
-            self.prefix, self.writer_id, self.file_index
+            "{}part-{}w{:02}-{:06}.parquet",
+            self.prefix,
+            if self.settings.run_id.is_empty() {
+                String::new()
+            } else {
+                format!("{}-", self.settings.run_id)
+            },
+            self.writer_id,
+            self.file_index
         )
     }
 
@@ -461,6 +479,8 @@ mod tests {
 
     fn settings(schema: SchemaRef, cap: Option<u64>) -> Arc<SinkSettings> {
         Arc::new(SinkSettings {
+            // Tests assert on file names, so keep them free of a timestamp.
+            run_id: String::new(),
             schema,
             row_group_rows: 500,
             part_size: 5 << 20,
@@ -677,7 +697,7 @@ mod tests {
             stats.clone(),
         );
 
-        let mut batch_of = |builder: &mut BatchBuilder, count: i64| {
+        let batch_of = |builder: &mut BatchBuilder, count: i64| {
             for index in 0..count {
                 let row: Vec<(String, Value)> = vec![
                     ("id".into(), Value::I64(index)),
@@ -727,6 +747,32 @@ mod tests {
         assert_eq!(total, 500, "only the second batch survives");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The run id is what stops a restart from overwriting the last run, so
+    /// pin both spellings of the name.
+    #[test]
+    fn object_names_carry_the_writer_and_the_run() {
+        let tables = parse_schema("CREATE TABLE t (id BIGINT NOT NULL) ENGINE=OLAP").unwrap();
+        let builder = BatchBuilder::new(tables[0].columns.clone(), 8).unwrap();
+        let stats = Arc::new(Stats::default());
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+        let plain = settings(builder.schema(), None);
+        let mut sink = ParquetSink::new(store.clone(), "out/".into(), 7, plain, stats.clone());
+        assert_eq!(sink.next_path(), "out/part-w07-000001.parquet");
+        assert_eq!(sink.next_path(), "out/part-w07-000002.parquet");
+
+        let mut tagged = settings(builder.schema(), None).clone_for_test();
+        tagged.run_id = "20260910T143803Z-79ee76".into();
+        let mut sink = ParquetSink::new(store, "out/".into(), 0, Arc::new(tagged), stats);
+        assert_eq!(
+            sink.next_path(),
+            "out/part-20260910T143803Z-79ee76-w00-000001.parquet"
+        );
+        // A different run writes different names into the same prefix, which is
+        // the whole point: a restart adds to the dataset instead of replacing it.
+        assert_ne!(sink.next_path(), "out/part-w00-000002.parquet");
     }
 
     #[tokio::test]
