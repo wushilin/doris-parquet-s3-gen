@@ -19,7 +19,7 @@ TARGET_SIZE="10GiB"
 FILE_SIZE="2GiB"
 THREADS=""
 UPLOAD_THREADS="8"
-QUEUE_DEPTH="30"
+QUEUE_DEPTH="100"
 LOCAL_DIR=""
 DRY_RUN="no"
 
@@ -37,7 +37,7 @@ Options:
   -f, --file-size SIZE  roll to a new object at      (default: 2GiB)
   -j, --threads N       generation threads           (default: CPU count)
   -u, --upload-threads N  upload workers             (default: 8)
-  -q, --queue-depth N   batches buffered in the queue (default: 30)
+  -q, --queue-depth N   batches buffered in the queue (default: 100)
   -o, --local DIR       write to DIR instead of S3
   -n, --dry-run         print the command and exit
   -h, --help            this text

@@ -16,6 +16,7 @@ use object_store::buffered::BufWriter;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::aws::AmazonS3Builder;
+use object_store::{BackoffConfig, ClientOptions, RetryConfig};
 use object_store::ObjectStore;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
@@ -37,6 +38,10 @@ pub struct Stats {
     pub rows_flushed: AtomicU64,
     /// Bytes in files that have been closed and fully uploaded.
     pub bytes_written: AtomicU64,
+    /// Files abandoned after their upload kept failing. Rows in them are lost.
+    pub files_abandoned: AtomicU64,
+    /// Rows that went into those files and so never reached storage.
+    pub rows_lost: AtomicU64,
     /// Bytes written so far into files still open, across all writers.
     pub active_bytes: AtomicU64,
     pub files_completed: AtomicU64,
@@ -131,6 +136,23 @@ pub fn build_store(destination: &Destination) -> Result<(Arc<dyn ObjectStore>, S
             if config.s3.allow_http {
                 builder = builder.with_allow_http(true);
             }
+            // These were parsed and then dropped on the floor, leaving every
+            // run on object_store's defaults: ten attempts inside a
+            // three-minute window. Three minutes is not a lot of cover for a
+            // job that runs for days.
+            builder = builder
+                .with_retry(RetryConfig {
+                    backoff: BackoffConfig {
+                        init_backoff: std::time::Duration::from_millis(100),
+                        max_backoff: config.upload.max_backoff,
+                        base: 2.0,
+                    },
+                    max_retries: config.upload.retries as usize,
+                    retry_timeout: config.upload.retry_timeout,
+                })
+                .with_client_options(
+                    ClientOptions::new().with_timeout(config.upload.timeout),
+                );
             // Always set this explicitly. object_store defaults to path style,
             // so only ever passing `false` left virtual-hosted style
             // unreachable, which S3-compatible services such as Alibaba OSS
@@ -213,6 +235,10 @@ pub struct ParquetSink {
     reported_flushed: u64,
     /// Every row this writer has been handed, across all its files.
     rows_seen: u64,
+    /// Rows written into the file currently open. Cumulative `rows_seen` cannot
+    /// answer this, and abandoning a file loses every row in it, not just the
+    /// ones still sitting in an unfinished row group.
+    rows_in_active: u64,
 }
 
 impl ParquetSink {
@@ -235,6 +261,7 @@ impl ParquetSink {
             reported_active: 0,
             reported_flushed: 0,
             rows_seen: 0,
+            rows_in_active: 0,
         }
     }
 
@@ -270,6 +297,7 @@ impl ParquetSink {
             AsyncArrowWriter::try_new(buffered, self.settings.schema.clone(), Some(self.writer_properties()))
                 .with_context(|| format!("failed to start Parquet file `{}`", path))?;
         self.active = Some(ActiveFile { writer, path });
+        self.rows_in_active = 0;
         Ok(())
     }
 
@@ -288,6 +316,7 @@ impl ParquetSink {
                 .with_context(|| format!("failed writing to `{}`", active.path))?;
         }
         self.rows_seen += rows;
+        self.rows_in_active += rows;
         self.stats.add_rows(rows);
         self.sync_buffer_gauge();
 
@@ -300,6 +329,42 @@ impl ParquetSink {
             }
         }
         Ok(())
+    }
+
+    /// Give up on the file being written, aborting its multipart upload so it
+    /// does not linger as billable parts, and reset so the next write opens a
+    /// fresh file. Used when an upload has exhausted its HTTP-level retries:
+    /// losing one file beats losing a run that has been going for days.
+    pub async fn abandon_active(&mut self) -> u64 {
+        let rows_lost = self.rows_in_active;
+        if let Some(active) = self.active.take() {
+            let mut buffered = active.writer.into_inner();
+            if let Err(error) = buffered.abort().await {
+                // Nothing further to do: the parts expire under the bucket's
+                // own lifecycle rule for incomplete multipart uploads.
+                eprintln!(
+                    "warning: could not abort the multipart upload for `{}`: {}",
+                    active.path, error
+                );
+            }
+        }
+        self.stats.files_abandoned.fetch_add(1, Ordering::Relaxed);
+        self.stats.rows_lost.fetch_add(rows_lost, Ordering::Relaxed);
+        // The gauges describe an open file, so they reset exactly as they do on
+        // a clean close. Rolling `rows_seen` back past the whole file also
+        // takes its finished row groups out of `rows_flushed`: those rows were
+        // encoded, but they went into an object that will never exist, and
+        // `reached_size_target` divides bytes by that figure.
+        apply_delta(&self.stats.buffered_bytes, &mut self.reported_buffer, 0);
+        apply_delta(&self.stats.active_bytes, &mut self.reported_active, 0);
+        self.rows_seen = self.rows_seen.saturating_sub(rows_lost);
+        self.rows_in_active = 0;
+        apply_delta(
+            &self.stats.rows_flushed,
+            &mut self.reported_flushed,
+            self.rows_seen,
+        );
+        rows_lost
     }
 
     /// Publish this writer's in-flight numbers into the shared gauges.
@@ -341,6 +406,8 @@ impl ParquetSink {
             .sum();
         self.stats.bytes_written.fetch_add(bytes, Ordering::Relaxed);
         self.stats.files_completed.fetch_add(1, Ordering::Relaxed);
+        // Those rows are in storage now, so a later abandon cannot lose them.
+        self.rows_in_active = 0;
         // Both byte gauges describe an open file, so they reset when it closes.
         apply_delta(&self.stats.buffered_bytes, &mut self.reported_buffer, 0);
         apply_delta(&self.stats.active_bytes, &mut self.reported_active, 0);
@@ -583,6 +650,81 @@ mod tests {
             }
         }
         assert_eq!(seen, expected.len());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Abandoning a file has to leave the writer usable: the point is that a
+    /// run of several days survives one bad upload, so the next batch must
+    /// land in a fresh file and the count must say a file was lost.
+    #[tokio::test]
+    async fn a_writer_keeps_going_after_abandoning_a_file() {
+        let dir = std::env::temp_dir().join(format!("dpsg-abandon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let destination = Destination::Local { directory: dir.clone() };
+        let (store, prefix) = build_store(&destination).expect("store");
+
+        let tables =
+            parse_schema("CREATE TABLE t (id BIGINT NOT NULL, note VARCHAR(64)) ENGINE=OLAP")
+                .unwrap();
+        let mut builder = BatchBuilder::new(tables[0].columns.clone(), 256).unwrap();
+        let stats = Arc::new(Stats::default());
+        let mut sink = ParquetSink::new(
+            store,
+            prefix,
+            0,
+            settings(builder.schema(), None),
+            stats.clone(),
+        );
+
+        let mut batch_of = |builder: &mut BatchBuilder, count: i64| {
+            for index in 0..count {
+                let row: Vec<(String, Value)> = vec![
+                    ("id".into(), Value::I64(index)),
+                    ("note".into(), Value::String(format!("row {}", index))),
+                ];
+                builder
+                    .append_row(|name| row.iter().find(|(key, _)| key == name).map(|(_, v)| v))
+                    .unwrap();
+            }
+            builder.finish().unwrap()
+        };
+
+        let first = batch_of(&mut builder, 500);
+        sink.write(first).await.expect("first batch");
+        // Simulate the upload having exhausted its retries.
+        let lost = sink.abandon_active().await;
+        assert_eq!(stats.files_abandoned.load(Ordering::Relaxed), 1);
+        // Every row in the file is lost, including the ones whose row group had
+        // already been encoded. A --rows run credits this back to its quota.
+        assert_eq!(lost, 500);
+        assert_eq!(stats.rows_lost.load(Ordering::Relaxed), 500);
+        assert_eq!(
+            stats.rows_flushed.load(Ordering::Relaxed),
+            0,
+            "rows in an object that will never exist must not count as flushed"
+        );
+
+        let second = batch_of(&mut builder, 500);
+        sink.write(second).await.expect("writer still usable");
+        sink.finish().await.expect("finish");
+
+        // Exactly one file: the abandoned one never completed.
+        let written: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+            .collect();
+        assert_eq!(written.len(), 1, "abandoned file must not appear");
+        assert_eq!(stats.files_completed.load(Ordering::Relaxed), 1);
+
+        let file = std::fs::File::open(written[0].path()).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let total: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+        assert_eq!(total, 500, "only the second batch survives");
 
         std::fs::remove_dir_all(&dir).ok();
     }

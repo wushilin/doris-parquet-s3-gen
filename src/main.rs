@@ -57,8 +57,10 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     upload_threads: usize,
 
-    /// Batches that may wait between generation and upload.
-    #[arg(long, default_value_t = 30)]
+    /// Batches that may wait between generation and upload. Deeper rides out
+    /// longer upload stalls without starving the generators, at roughly
+    /// batch_rows x bytes-per-row of memory per slot.
+    #[arg(long, default_value_t = 100)]
     queue_depth: usize,
 
     /// Rows per batch handed to the queue.
@@ -1417,15 +1419,65 @@ async fn generator_loop(
 
 /// Drain the queue, writing batches to this worker's own Parquet files.
 /// Runs until the queue is closed and empty, then closes the file in flight.
+/// Drain the queue into one Parquet writer.
+///
+/// A failure here has already been through every HTTP-level retry the store
+/// was configured with, so the question is what a run measured in days should
+/// do about it. Taking the whole job down over one file is the wrong answer:
+/// the writer abandons that file, counts it, and keeps draining. `file_retries`
+/// bounds how much of that is tolerable before the run really does fail, and
+/// zero restores failing on the first error.
 async fn upload_worker(
     queue: async_channel::Receiver<arrow::record_batch::RecordBatch>,
     mut sink: sink::ParquetSink,
+    file_retries: u32,
+    writer_id: usize,
+    remaining_rows: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
+    let mut abandoned = 0u32;
     while let Ok(batch) = queue.recv().await {
-        sink.write(batch).await?;
+        let Err(error) = sink.write(batch).await else {
+            continue;
+        };
+        abandoned += 1;
+        if abandoned > file_retries {
+            return Err(error).with_context(|| {
+                format!(
+                    "writer {} gave up after {} failed files; raise upload.file_retries \
+                     to tolerate more, or upload.retry_timeout to retry each request longer",
+                    writer_id, abandoned
+                )
+            });
+        }
+        eprintln!(
+            "writer {}: upload failed ({} of {} tolerated), abandoning this file \
+             and starting a new one: {:#}",
+            writer_id, abandoned, file_retries, error
+        );
+        let lost = sink.abandon_active().await;
+        // A --rows run spends its quota when a row is generated, not when it
+        // lands, so without this the run would finish short by exactly the
+        // rows in the file just thrown away. Putting them back has the
+        // generators make up the difference, provided they are still running.
+        // A --target-size run needs no such help: abandoned bytes never reach
+        // the counter the target is measured against.
+        if let Some(remaining) = remaining_rows.as_ref() {
+            remaining.fetch_add(lost, Ordering::Relaxed);
+        }
     }
     // Always close: an unclosed multipart upload never becomes an object.
-    sink.finish().await
+    if let Err(error) = sink.finish().await {
+        abandoned += 1;
+        if abandoned > file_retries {
+            return Err(error)
+                .with_context(|| format!("writer {} failed to close its last file", writer_id));
+        }
+        eprintln!(
+            "writer {}: could not close the last file ({} of {} tolerated): {:#}",
+            writer_id, abandoned, file_retries, error
+        );
+    }
+    Ok(())
 }
 
 /// Redraw the status block once a second while generation runs.
@@ -1610,6 +1662,12 @@ async fn run_parquet(
     let upload_threads = args.upload_threads.max(1);
     let queue_depth = args.queue_depth.max(1);
 
+    // A local run writes straight to a file, so there is no upload to give up
+    // on and nothing to tolerate.
+    let file_retries = s3_config
+        .as_ref()
+        .map(|config| config.upload.file_retries)
+        .unwrap_or(0);
     let (destination, part_size, max_concurrent_parts, row_group_rows, compression, dictionary) = match &s3_config {
         Some(config) => (
             sink::Destination::S3 { config: Box::new(config.clone()) },
@@ -1715,7 +1773,13 @@ async fn run_parquet(
             settings.clone(),
             stats.clone(),
         );
-        uploaders.push(tokio::spawn(upload_worker(rx.clone(), sink)));
+        uploaders.push(tokio::spawn(upload_worker(
+            rx.clone(),
+            sink,
+            file_retries,
+            writer_id,
+            remaining_rows.clone(),
+        )));
     }
     // Only the workers should hold receivers, so the queue can close cleanly.
     drop(rx);
@@ -1776,13 +1840,24 @@ async fn run_parquet(
     let rows = stats.rows.load(Ordering::Relaxed);
     let bytes = stats.bytes_written.load(Ordering::Relaxed);
     debug_assert_eq!(rows, stats.rows_generated.load(Ordering::Relaxed));
+    let abandoned = stats.files_abandoned.load(Ordering::Relaxed);
     eprintln!(
-        "done: {} rows in {} files, {} in {:.1}s ({} rows/s)",
+        "done: {} rows in {} files, {} in {:.1}s ({} rows/s){}",
         rows,
         stats.files_completed.load(Ordering::Relaxed),
         fmt_bytes_short(bytes),
         elapsed.as_secs_f64(),
         (rows as f64 / elapsed.as_secs_f64()) as u64,
+        if abandoned == 0 {
+            String::new()
+        } else {
+            format!(
+                "  [{} file(s) abandoned after repeated upload failures, \
+                 {} rows lost]",
+                abandoned,
+                stats.rows_lost.load(Ordering::Relaxed)
+            )
+        },
     );
     Ok(())
 }

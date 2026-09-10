@@ -69,10 +69,27 @@ pub struct UploadSection {
     /// Parts uploaded concurrently per file.
     #[serde(default = "default_concurrency")]
     pub max_concurrent_parts: usize,
+    /// Attempts after the first for one HTTP request.
     #[serde(default = "default_retries")]
     pub retries: u32,
+    /// Deadline for a single HTTP request.
     #[serde(default = "default_timeout", deserialize_with = "de_duration")]
     pub timeout: Duration,
+    /// Total wall clock a single request may spend being retried. This is the
+    /// one that decides whether a run survives an outage: retries stop at
+    /// whichever of this and `retries` comes first, so a generous count with a
+    /// short window still gives up in a couple of minutes.
+    #[serde(default = "default_retry_timeout", deserialize_with = "de_duration")]
+    pub retry_timeout: Duration,
+    /// Ceiling on the exponential backoff between attempts.
+    #[serde(default = "default_max_backoff", deserialize_with = "de_duration")]
+    pub max_backoff: Duration,
+    /// Files a writer may lose to upload failures before the run gives up.
+    /// Past every HTTP-level retry, a writer abandons the file it was building
+    /// and starts a new one rather than taking the whole run down; the rows in
+    /// that file are lost. Zero restores the old behaviour of failing the run.
+    #[serde(default = "default_file_retries")]
+    pub file_retries: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,10 +118,22 @@ fn default_concurrency() -> usize {
     8
 }
 fn default_retries() -> u32 {
-    3
+    10
 }
 fn default_timeout() -> Duration {
     Duration::from_secs(60)
+}
+/// object_store defaults this to three minutes, which is short for a run
+/// measured in days: a storage service having a bad ten minutes should not
+/// cost the whole job.
+fn default_retry_timeout() -> Duration {
+    Duration::from_secs(15 * 60)
+}
+fn default_max_backoff() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_file_retries() -> u32 {
+    8
 }
 fn default_compression() -> String {
     "zstd".to_string()
@@ -126,6 +155,9 @@ impl Default for UploadSection {
             max_concurrent_parts: default_concurrency(),
             retries: default_retries(),
             timeout: default_timeout(),
+            retry_timeout: default_retry_timeout(),
+            max_backoff: default_max_backoff(),
+            file_retries: default_file_retries(),
         }
     }
 }
@@ -338,8 +370,20 @@ part_size = "10MiB"
 # part_size x max_concurrent_parts, so 10MiB x 8 = 80MiB here.
 max_concurrent_parts = 8
 
-retries = 3
+# Attempts after the first for one HTTP request, and the deadline for each.
+retries = 10
 timeout = "60s"
+
+# Total wall clock one request may spend being retried, and the ceiling on the
+# backoff between attempts. These are what carry a multi-day run through an
+# outage; object_store's own default window is three minutes.
+retry_timeout = "15m"
+max_backoff = "60s"
+
+# Past those retries, a writer abandons the file it was building and starts a
+# new one instead of failing the run. The rows in the abandoned file are lost
+# and the count is reported at the end. Set to 0 to fail the run instead.
+file_retries = 8
 
 [parquet]
 # zstd, snappy, gzip, lz4, lz4_raw, or none. Doris reads all of these.
@@ -419,6 +463,33 @@ mod tests {
         assert!(config.check_file_cap(2 << 30).is_ok());
         let err = config.check_file_cap(200 << 30).expect_err("200GiB needs too many parts");
         assert!(err.to_string().contains("10000"), "{}", err);
+    }
+
+    /// These settings were parsed and then never applied, so the run silently
+    /// used object_store's three-minute retry window. Pin the values and the
+    /// defaults now that they reach the client.
+    #[test]
+    fn upload_retry_settings_have_long_run_defaults() {
+        let config = parse("[s3]\nbucket = \"b\"\nregion = \"r\"\n").expect("parse");
+        assert_eq!(config.upload.retries, 10);
+        assert_eq!(config.upload.timeout, Duration::from_secs(60));
+        assert_eq!(config.upload.retry_timeout, Duration::from_secs(15 * 60));
+        assert_eq!(config.upload.max_backoff, Duration::from_secs(60));
+        assert_eq!(config.upload.file_retries, 8);
+    }
+
+    #[test]
+    fn upload_retry_settings_can_be_overridden() {
+        let config = parse(
+            "[s3]\nbucket = \"b\"\nregion = \"r\"\n[upload]\nretries = 25\n\
+             retry_timeout = \"1h\"\nmax_backoff = \"2m\"\nfile_retries = 0\n",
+        )
+        .expect("parse");
+        assert_eq!(config.upload.retries, 25);
+        assert_eq!(config.upload.retry_timeout, Duration::from_secs(3600));
+        assert_eq!(config.upload.max_backoff, Duration::from_secs(120));
+        // Zero is meaningful: fail the run on the first unrecoverable upload.
+        assert_eq!(config.upload.file_retries, 0);
     }
 
     #[test]

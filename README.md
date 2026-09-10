@@ -174,12 +174,62 @@ rather than seconds, which keeps the sub-second digits as varied as they were
 when every row called the clock. That matters more than it looks: a datetime
 column that quietly became compressible would change what a load test measures.
 
+## Surviving a long run
+
+A run measured in days will meet a storage service having a bad minute. Three
+layers stand between that and losing the job.
+
+`object_store` retries a failed request on its own. That is configured in
+`[upload]`, and it was worth checking: `retries` and `timeout` were being
+parsed and then never handed to the client, so every run used the library
+default of ten attempts inside a three-minute window. Three minutes is thin
+cover for a job that runs for days.
+
+```toml
+[upload]
+retries = 10           # attempts after the first, per request
+timeout = "60s"        # deadline for one request
+retry_timeout = "15m"  # total wall clock one request may spend retrying
+max_backoff = "60s"    # ceiling on the exponential backoff
+file_retries = 8       # files a writer may lose before the run gives up
+```
+
+`retry_timeout` is the one that decides whether a run survives an outage.
+Retries stop at whichever of it and `retries` comes first, so a generous count
+with a short window still gives up in a couple of minutes.
+
+Past those, a writer abandons the file it was building and starts a new one
+rather than taking the whole run down. The multipart upload is aborted, so the
+parts it had already sent do not linger as billable storage; if that abort
+cannot get through either, the parts are left for the bucket's own lifecycle
+rule, which a long-running job should have anyway. Rows in an abandoned file
+are gone -- nothing is retained to re-upload from -- so they are counted and
+the final line says so rather than letting a degraded run look clean:
+
+```
+done: 41231 rows in 4 files, 2.1GiB in 611.2s  [1 file(s) abandoned after repeated upload failures, 8192 rows lost]
+```
+
+Whether the run makes those rows up depends on what bounds it. A
+`--target-size` run does automatically, because abandoned bytes never reach the
+counter the target is measured against. A `--rows` run spends its quota when a
+row is generated rather than when it lands, so the lost rows are credited back
+to it explicitly; that works as long as the generators are still running, which
+they normally are, since uploads lag generation.
+
+Set `file_retries = 0` to fail the run on the first upload that cannot be
+recovered, which is the right setting when a partial dataset is worse than no
+dataset.
+
 ## Sizing and limits
 
 `--rows` is exact. `--target-size` is approximate, because a row's compressed
 size is unknown until its row group is encoded. Generators project the observed
-bytes-per-row across every row produced, which lands within a few percent and
-gets tighter on larger runs. Expect roughly +0.5% at 10GiB.
+bytes-per-row across every row produced, and then whatever is already queued
+still has to be written, so a run overshoots by up to
+`queue_depth x batch_rows x bytes-per-row`. At the defaults that is around
+300MiB: a rounding error against a multi-terabyte target, most of a small one.
+Lower `--queue-depth` when a small `--target-size` needs to be tight.
 
 `--file-size` rolls to a new object once a file passes the cap. Files can only
 roll on a row group boundary, so the result is between the cap and the cap plus
