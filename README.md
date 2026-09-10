@@ -74,17 +74,29 @@ level only pays when the data actually repeats. Measure before tuning.
 
 ### Unique ids: `sequence_string` vs `uuid`
 
-`uuid` emits a real v4 UUID, so values are unpredictable and independent
-between runs. Generating one is cheaper than it looks: on `sample.spec`, which
-has three UUID columns per row, swapping all three for counters moved the full
-pipeline from roughly 395k to 435k rows/s at four generator threads. Worth
-having, but UUID generation is not the bottleneck anyone expects it to be.
+`uuid` emits a real v4 UUID. The sixteen random bytes come from the
+generator's own ChaCha12 stream, seeded from the OS once per thread, not from
+`Uuid::new_v4`: that draws from the entropy pool on every call, which is a
+`getrandom` syscall on any kernel without the vDSO entry point added in 6.11.
+Three UUID columns meant three syscalls a row. Taking the bytes from the
+already-seeded stream is worth about 31% on the whole pipeline, 922k to 1.20M
+rows/s at four generator threads, and produces a v4 UUID by the same
+construction.
 
-The size difference is the part that matters. The same 4M rows are 358 MiB of
+The interesting difference is size, not speed. The same 4M rows are 358 MiB of
 Parquet with `uuid` and 139 MiB with `sequence_string`, because dense ordered
-strings compress and random ones do not. On an upload-bound run that is 2.6x
-less to push. On a `--target-size` run it cuts the other way: the same byte
-budget now holds 2.6x more rows, so the run takes correspondingly longer.
+strings compress and random ones do not. Which way that cuts depends entirely
+on what bounds the run:
+
+| | bytes/row | rows for 40 TB | hours at 4 threads |
+|---|---|---|---|
+| `uuid` | 93.8 | 4.3e11 | 98 |
+| `sequence_string` | 36.4 | 1.1e12 | 312 |
+
+Bounded by bytes, `uuid` wins three times over: it needs 2.6x fewer rows to
+reach the same volume, and it is now the faster generator per row as well.
+Bounded by rows, `sequence_string` wins instead, with 2.6x less to compress and
+upload for the same row count.
 
 `sequence_string` renders a counter into a fixed-width string instead:
 
@@ -104,11 +116,12 @@ where they were. All generator threads share one cursor and claim blocks of it,
 so values are unique across threads; the atomic is touched once per block, not
 once per row.
 
-Reach for `uuid` when the test depends on values being random or unguessable,
-or when you are measuring compression, compaction, or write amplification and
-need the pessimistic case. Reach for `sequence_string` when a column only needs
-to be unique and the right size, and you would rather spend the bytes
-elsewhere.
+Reach for `uuid` when the run is bounded by a data volume, or when the test
+depends on values being random, or when you are measuring compression,
+compaction, or write amplification and need the pessimistic case. `sample.spec`
+uses it for exactly the first reason. Reach for `sequence_string` when the run
+is bounded by rows, a column only needs to be unique and the right size, and
+you would rather not push the extra bytes.
 
 ### Where generation time goes
 

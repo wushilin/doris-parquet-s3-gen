@@ -10,25 +10,19 @@ batch:
   rows: 1000
 
 fields:
-  # A counter zero-padded to 36 characters: same width as the UUID this used
-  # to be, so it still fits varchar(256) and still costs 36 bytes per row.
-  # A counter rather than `type: uuid` because dense strings compress, and the
-  # three id columns here are the difference between 358 MiB and 139 MiB of
-  # Parquet per 4M rows. Switch back to `type: uuid` when the point of the run
-  # is random, incompressible data.
+  # A real UUID, and deliberately so. These three id columns are what make a
+  # row incompressible: with UUIDs 4M rows are 358 MiB of Parquet, with padded
+  # counters 139 MiB. When the target is a data volume rather than a row count
+  # that is the whole game, because 40 TB is 4.3e11 rows of UUIDs and 1.1e12
+  # rows of counters. Fewer rows for the same bytes wins even before the
+  # per-row rate, and it sidesteps the counter-width ceiling entirely.
   #
-  # The literal prefix carries 16 of the 36 characters, so only 20 digits are
-  # zero-padded per value. That is worth about 5% on the whole pipeline over
-  # padding all 36, and 20 digits is past the u64 counter range, so it cannot
-  # overflow. A UUID-shaped template would leave only the last group, twelve
-  # digits, and 40 TB of this data is about 1.1e12 rows -- past that ceiling.
-  # The prefix also keeps the three id columns from being copies of each other.
+  # Use `sequence_string` instead when the run is bounded by rows rather than
+  # bytes and you would rather not push the extra bytes over the network.
   - name: invoiceid
     order: 0
     gen:
-      type: sequence_string
-      template: "inv0000000000000{}"
-      width: 36
+      type: uuid
 
   # Partition key: AUTO PARTITION BY RANGE(date_trunc(eventdate, 'week')).
   # A 30-day window produces about five weekly partitions.
@@ -41,21 +35,17 @@ fields:
       format: "%Y-%m-%d %H:%M:%S%.6f"
 
   # Distribution key: DISTRIBUTED BY HASH(organisationid) BUCKETS 8.
-  # A fresh value per row spreads buckets perfectly but means every row is a
+  # A fresh UUID per row spreads buckets perfectly but means every row is a
   # different organisation. See the notes on tenant skew below.
   - name: organisationid
     order: 2
     gen:
-      type: sequence_string
-      template: "org0000000000000{}"
-      width: 36
+      type: uuid
 
   - name: eventid
     order: 3
     gen:
-      type: sequence_string
-      template: "evt0000000000000{}"
-      width: 36
+      type: uuid
 
   # CDC operation. Both values are exactly 6 characters, which is the full
   # width of varchar(6), so no other verb fits without widening the column.

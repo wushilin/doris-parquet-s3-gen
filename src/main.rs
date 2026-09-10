@@ -34,7 +34,6 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Generate data from a Doris schema and stream it to S3 as Parquet")]
@@ -1222,7 +1221,23 @@ impl FieldGenerator for UuidGenerator {
         if should_emit_null(self.null_rate, rng)? {
             return Ok(Value::Null);
         }
-        Ok(Value::String(Uuid::new_v4().to_string()))
+        // `Uuid::new_v4` draws from the OS entropy pool, which is a getrandom
+        // syscall per value on any kernel without the vDSO entry point added
+        // in 6.11. A spec with three UUID columns made three syscalls a row.
+        // The generator is already handed a ChaCha12 stream seeded from that
+        // same pool once per thread, so take the sixteen bytes from there: the
+        // result is a v4 UUID by the same construction, just without the trip
+        // into the kernel.
+        let mut bytes = [0u8; 16];
+        rng.fill_bytes(&mut bytes);
+        let uuid = uuid::Builder::from_random_bytes(bytes).into_uuid();
+        // encode_lower writes into a stack buffer. `to_string` would go
+        // through Display and the formatting machinery to reach the same 36
+        // characters.
+        let mut buffer = [0u8; uuid::fmt::Hyphenated::LENGTH];
+        Ok(Value::String(
+            uuid.hyphenated().encode_lower(&mut buffer).to_string(),
+        ))
     }
 }
 
@@ -3529,6 +3544,8 @@ mod tests {
             .map(|_| generator.generate(&ctx, &mut rng).unwrap())
             .collect()
     }
+
+    use uuid::Uuid;
 
     fn compile_gen(yaml: &str) -> Result<Generator> {
         let spec = serde_yaml::from_str::<GeneratorSpec>(yaml)?;
