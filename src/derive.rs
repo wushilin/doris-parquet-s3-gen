@@ -35,6 +35,14 @@ pub fn spec_yaml_from_table(table: &Table) -> Result<String> {
     out.push_str("context:\n  reset: row\n\nbatch:\n  rows: 1000\n\nfields:\n");
 
     for (index, column) in table.columns.iter().enumerate() {
+        if let Some(function) = column.ty.load_function() {
+            out.push_str(&format!(
+                "  # {} has no Parquet form Doris loads directly: this writes its\n  # source values; load the column with {}(`{}`).\n",
+                column.ty.sql_name(),
+                function,
+                column.name
+            ));
+        }
         out.push_str(&format!("  - name: {}\n", yaml_scalar(&column.name)));
         out.push_str(&format!("    order: {}\n", index));
         out.push_str("    gen:\n");
@@ -112,7 +120,10 @@ fn generator_by_type(ty: &DorisType) -> String {
         DorisType::SmallInt => int_range(0, 32_767),
         DorisType::Int => int_range(0, 1_000_000),
         DorisType::BigInt => int_range(0, 1_000_000_000),
-        DorisType::LargeInt => int_range(0, 1_000_000_000_000),
+        // LARGEINT usually holds unsigned 64-bit ids, such as a ClickHouse
+        // UInt64 converted to Doris, so span that range: it exercises the
+        // values BIGINT cannot hold. Quoted, since it exceeds 64-bit signed.
+        DorisType::LargeInt => "type: int_range\nmin: 0\nmax: \"18446744073709551615\"".to_string(),
         DorisType::Float => "type: float_range\nmin: 0.0\nmax: 1000.0\nprecision: 3".to_string(),
         DorisType::Double => {
             "type: float_range\nmin: 0.0\nmax: 1000000.0\nprecision: 6".to_string()
@@ -136,18 +147,95 @@ fn generator_by_type(ty: &DorisType) -> String {
         DorisType::Char { len } => fixed_width_string(*len),
         DorisType::Varchar { len } => {
             if *len >= LOREM_MIN_WIDTH {
-                "type: lorem\nwords_min: 3\nwords_max: 12".to_string()
+                lorem_within(*len)
             } else {
                 fixed_width_string(*len)
             }
         }
         DorisType::String => "type: lorem\nwords_min: 3\nwords_max: 12".to_string(),
-        DorisType::Json | DorisType::Variant => "type: constant\nvalue: \"{}\"".to_string(),
-        // Filtered out before we get here.
-        DorisType::Opaque(_) | DorisType::Array(_) | DorisType::Map(_, _) | DorisType::Struct(_) => {
-            "type: constant\nvalue: \"\"".to_string()
+        // A small object; the writer renders it as JSON text.
+        DorisType::Json | DorisType::Variant => [
+            "type: struct",
+            "fields:",
+            "  - name: id",
+            "    gen:",
+            "      type: int_range",
+            "      min: 1",
+            "      max: 1000000",
+            "  - name: tag",
+            "    gen:",
+            "      type: lorem",
+            "      words_min: 1",
+            "      words_max: 1",
+            "  - name: score",
+            "    gen:",
+            "      type: float_range",
+            "      min: 0.0",
+            "      max: 100.0",
+            "      precision: 2",
+        ]
+        .join("\n"),
+        DorisType::Ipv4 => "type: ipv4\ncidr: \"10.0.0.0/8\"".to_string(),
+        DorisType::Ipv6 => "type: ipv6\ncidr: \"2001:db8::/32\"".to_string(),
+        DorisType::Array(element) => format!(
+            "type: array\nmin_len: 0\nmax_len: 3\nelement:\n{}",
+            indent(&generator_by_type(element), 2)
+        ),
+        DorisType::Map(key, value) => format!(
+            "type: map\nmin_len: 0\nmax_len: 3\nkey:\n{}\nvalue:\n{}",
+            indent(&map_key_generator(key), 2),
+            indent(&generator_by_type(value), 2)
+        ),
+        DorisType::Struct(fields) => {
+            let mut out = String::from("type: struct\nfields:");
+            for (name, field_type) in fields {
+                out.push_str(&format!(
+                    "\n  - name: {}\n    gen:\n{}",
+                    yaml_scalar(name),
+                    indent(&generator_by_type(field_type), 6)
+                ));
+            }
+            out
         }
+        // Sketch sources: member ids, distinct-count keys, and measurements.
+        DorisType::Bitmap => int_range(1, 10_000_000),
+        DorisType::Hll => "type: uuid".to_string(),
+        DorisType::QuantileState => {
+            "type: float_range\nmin: 0.0\nmax: 1000.0\nprecision: 3".to_string()
+        }
+        // Refused by spec_yaml_from_table before any generator is chosen.
+        DorisType::AggState(_) => unreachable!("AGG_STATE is not generatable"),
     }
+}
+
+/// Map keys want a small domain of short values, so draws collide and
+/// dedupe naturally rather than every map holding unique noise.
+fn map_key_generator(key: &DorisType) -> String {
+    match string_width(key) {
+        Some(width) if width >= longest_lorem_word() => {
+            "type: lorem\nwords_min: 1\nwords_max: 1".to_string()
+        }
+        Some(width) => fixed_width_string(width),
+        None => generator_by_type(key),
+    }
+}
+
+fn longest_lorem_word() -> u32 {
+    crate::LOREM_WORDS.iter().map(|word| word.len()).max().unwrap_or(1) as u32
+}
+
+/// Lorem text that can never exceed `len` bytes: at most as many words as
+/// fit when every word is the longest one, each followed by a space.
+fn lorem_within(len: u32) -> String {
+    let longest = longest_lorem_word();
+    let words_max = ((len + 1) / (longest + 1)).clamp(1, 12);
+    let words_min = words_max.min(3);
+    format!("type: lorem\nwords_min: {}\nwords_max: {}", words_min, words_max)
+}
+
+fn indent(text: &str, spaces: usize) -> String {
+    let pad = " ".repeat(spaces);
+    text.lines().map(|line| format!("{}{}", pad, line)).collect::<Vec<_>>().join("\n")
 }
 
 /// Hex-encoded random bytes sized so the result never exceeds `len` characters.
@@ -169,8 +257,12 @@ fn int_range(min: i64, max: i64) -> String {
 }
 
 /// Keep the generated magnitude inside the declared precision.
-fn decimal_range(precision: u8, scale: u8) -> String {
-    let integer_digits = precision.saturating_sub(scale);
+fn decimal_range(precision: u8, column_scale: u8) -> String {
+    let integer_digits = precision.saturating_sub(column_scale);
+    // Generate at most 18 fractional digits. The writer pads to the column's
+    // scale, and a DECIMAL(76, 60) would otherwise ask for 69-digit bounds,
+    // past what the generator's 128-bit arithmetic holds.
+    let scale = column_scale.min(18);
     // Cap the whole part so very wide DECIMALs stay readable.
     let digits = integer_digits.min(9);
     let max_whole = if digits == 0 {
@@ -300,10 +392,46 @@ mod tests {
 
     #[test]
     fn refuses_ungeneratable_columns() {
-        let tables = parse_schema("CREATE TABLE t (a INT, b HLL, c ARRAY<INT>) ENGINE=OLAP").unwrap();
+        let tables =
+            parse_schema("CREATE TABLE t (a INT, b AGG_STATE<sum(int)>) ENGINE=OLAP").unwrap();
         let err = spec_yaml_from_table(&tables[0]).unwrap_err().to_string();
         assert!(err.contains("b"), "error names the offending column: {}", err);
-        assert!(err.contains("c"));
+    }
+
+    #[test]
+    fn lorem_never_outgrows_its_varchar() {
+        let longest = longest_lorem_word();
+        for len in [64u32, 70, 94, 95, 200, 65533] {
+            let yaml = lorem_within(len);
+            let words: u32 = yaml
+                .lines()
+                .find_map(|line| line.strip_prefix("words_max: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let worst_case = words * longest + words.saturating_sub(1);
+            assert!(worst_case <= len, "VARCHAR({}) could receive {} bytes", len, worst_case);
+        }
+    }
+
+    #[test]
+    fn derives_every_type_including_nested_ones() {
+        let yaml = derive(
+            "CREATE TABLE t (
+                a ARRAY<INT>, b MAP<VARCHAR(32), DECIMAL(10,2)>,
+                c STRUCT<city:VARCHAR(80), zip:INT>, d JSON, e IPV4, f IPV6,
+                g BITMAP, h HLL, i QUANTILE_STATE, j LARGEINT, k DECIMAL(76,60)
+            ) ENGINE=OLAP",
+        );
+        for expected in [
+            "type: array", "element:", "type: map", "key:", "type: struct",
+            "type: ipv4", "type: ipv6", "to_bitmap(`g`)", "hll_hash(`h`)",
+            "to_quantile_state(`i`)", "\"18446744073709551615\"",
+        ] {
+            assert!(yaml.contains(expected), "missing {}:\n{}", expected, yaml);
+        }
+        // Nested blocks must still be valid YAML.
+        serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("derived YAML parses");
     }
 
     #[test]

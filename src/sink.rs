@@ -64,11 +64,19 @@ pub enum Destination {
 }
 
 pub struct SinkSettings {
-    /// Distinguishes one run's objects from another's in the same prefix.
-    /// Without it every run starts its file numbering at one again and
-    /// overwrites the last run's output, which is a bad way to discover that a
-    /// restart does not resume. Empty keeps the older, shorter names.
+    /// Distinguishes one run's objects from another's in the same prefix, as
+    /// a folder of its own. Without it every run starts its file numbering at
+    /// one again and overwrites the last run's output. A folder per run also
+    /// means one run can be loaded or deleted by prefix alone. Empty writes
+    /// straight into the prefix, the older flat layout.
     pub run_id: String,
+    /// Group a run's files into `batch-NNNNN/` folders of this many files, so
+    /// each folder is a ready-made unit for one Doris load job. Zero disables.
+    pub files_per_folder: u64,
+    /// Files opened so far across every writer. Batch folders are assigned
+    /// from this shared count, so each folder fills to exactly
+    /// `files_per_folder` regardless of which writer produced its files.
+    pub file_counter: Arc<AtomicU64>,
     pub schema: SchemaRef,
     pub row_group_rows: usize,
     pub part_size: usize,
@@ -84,6 +92,8 @@ impl SinkSettings {
     fn clone_for_test(&self) -> Self {
         Self {
             run_id: self.run_id.clone(),
+            files_per_folder: self.files_per_folder,
+            file_counter: self.file_counter.clone(),
             schema: self.schema.clone(),
             row_group_rows: self.row_group_rows,
             part_size: self.part_size,
@@ -144,8 +154,20 @@ fn apply_delta(gauge: &AtomicU64, reported: &mut u64, current: u64) {
 }
 
 struct ActiveFile {
-    writer: AsyncArrowWriter<BufWriter>,
+    writer: Box<AsyncArrowWriter<BufWriter>>,
     path: String,
+}
+
+impl ActiveFile {
+    /// Bytes handed to the object store so far.
+    fn bytes_written(&self) -> u64 {
+        self.writer.bytes_written() as u64
+    }
+
+    /// Bytes held in memory, and rows not yet encoded into a row group.
+    fn in_progress(&self) -> (u64, u64) {
+        (self.writer.in_progress_size() as u64, self.writer.in_progress_rows() as u64)
+    }
 }
 
 /// One writer, owned by a single producer task. Files roll at the size cap.
@@ -202,17 +224,21 @@ impl ParquetSink {
     /// distinct names.
     fn next_path(&mut self) -> String {
         self.file_index += 1;
-        format!(
-            "{}part-{}w{:02}-{:06}.parquet",
-            self.prefix,
-            if self.settings.run_id.is_empty() {
-                String::new()
-            } else {
-                format!("{}-", self.settings.run_id)
-            },
-            self.writer_id,
-            self.file_index
-        )
+        let mut key = self.prefix.clone();
+        if !self.settings.run_id.is_empty() {
+            key.push_str(&self.settings.run_id);
+            key.push('/');
+        }
+        let opened = self.settings.file_counter.fetch_add(1, Ordering::Relaxed);
+        // Zero files per folder means no batch folders; checked_div yields None.
+        if let Some(batch) = opened.checked_div(self.settings.files_per_folder) {
+            key.push_str(&format!("batch-{:05}/", batch + 1));
+        }
+        key.push_str(&format!(
+            "part-w{:02}-{:06}.parquet",
+            self.writer_id, self.file_index
+        ));
+        key
     }
 
     fn writer_properties(&self) -> WriterProperties {
@@ -235,9 +261,15 @@ impl ParquetSink {
             self.settings.part_size,
         )
         .with_max_concurrency(self.settings.max_concurrent_parts);
-        let writer =
-            AsyncArrowWriter::try_new(buffered, self.settings.schema.clone(), Some(self.writer_properties()))
-                .with_context(|| format!("failed to start Parquet file `{}`", path))?;
+
+        let writer = Box::new(
+            AsyncArrowWriter::try_new(
+                buffered,
+                self.settings.schema.clone(),
+                Some(self.writer_properties()),
+            )
+            .with_context(|| format!("failed to start Parquet file `{}`", path))?,
+        );
         self.active = Some(ActiveFile { writer, path });
         self.rows_in_active = 0;
         Ok(())
@@ -264,8 +296,8 @@ impl ParquetSink {
 
         if let Some(cap) = self.settings.file_cap {
             let written = self.reported_active;
-            // Files can only roll on a row group boundary, so the final size
-            // lands between the cap and the cap plus one row group.
+            // Files can only roll on a row group boundary, so a file lands
+            // between the cap and the cap plus one row group.
             if written >= cap {
                 self.close_active().await?;
             }
@@ -313,11 +345,10 @@ impl ParquetSink {
     /// Both are delta-updated so the totals stay correct across writers.
     fn sync_buffer_gauge(&mut self) {
         let (buffered, file_bytes, pending_rows) = match self.active.as_ref() {
-            Some(active) => (
-                active.writer.in_progress_size() as u64,
-                active.writer.bytes_written() as u64,
-                active.writer.in_progress_rows() as u64,
-            ),
+            Some(active) => {
+                let (buffered, pending_rows) = active.in_progress();
+                (buffered, active.bytes_written(), pending_rows)
+            }
             // With no file open, everything this writer holds has been flushed.
             None => (0, 0, 0),
         };
@@ -370,7 +401,7 @@ impl ParquetSink {
     pub fn current_file(&self) -> Option<(String, u64)> {
         self.active
             .as_ref()
-            .map(|active| (active.path.clone(), active.writer.bytes_written() as u64))
+            .map(|active| (active.path.clone(), active.bytes_written()))
     }
 }
 
@@ -380,12 +411,14 @@ mod tests {
     use super::*;
     use crate::parquet_out::BatchBuilder;
     use crate::schema::parse_schema;
-    use crate::Value;
+    use datagen::Value;
 
     fn settings(schema: SchemaRef, cap: Option<u64>) -> Arc<SinkSettings> {
         Arc::new(SinkSettings {
             // Tests assert on file names, so keep them free of a timestamp.
             run_id: String::new(),
+            files_per_folder: 0,
+            file_counter: Arc::new(AtomicU64::new(0)),
             schema,
             row_group_rows: 500,
             part_size: 5 << 20,
@@ -668,16 +701,29 @@ mod tests {
         assert_eq!(sink.next_path(), "out/part-w07-000001.parquet");
         assert_eq!(sink.next_path(), "out/part-w07-000002.parquet");
 
+        // A run id becomes a folder of its own, so a restart adds a sibling
+        // folder instead of replacing the last run's files.
         let mut tagged = settings(builder.schema(), None).clone_for_test();
         tagged.run_id = "20260910T143803Z-79ee76".into();
-        let mut sink = ParquetSink::new(store, "out/".into(), 0, Arc::new(tagged), stats);
+        let mut sink =
+            ParquetSink::new(store.clone(), "out/".into(), 0, Arc::new(tagged), stats.clone());
         assert_eq!(
             sink.next_path(),
-            "out/part-20260910T143803Z-79ee76-w00-000001.parquet"
+            "out/20260910T143803Z-79ee76/part-w00-000001.parquet"
         );
-        // A different run writes different names into the same prefix, which is
-        // the whole point: a restart adds to the dataset instead of replacing it.
         assert_ne!(sink.next_path(), "out/part-w00-000002.parquet");
+
+        // Batch folders nest inside the run folder and count files across
+        // every writer that shares the settings.
+        let mut batched = settings(builder.schema(), None).clone_for_test();
+        batched.run_id = "r1".into();
+        batched.files_per_folder = 2;
+        let batched = Arc::new(batched);
+        let mut a = ParquetSink::new(store.clone(), "out/".into(), 0, batched.clone(), stats.clone());
+        let mut b = ParquetSink::new(store, "out/".into(), 1, batched, stats);
+        assert_eq!(a.next_path(), "out/r1/batch-00001/part-w00-000001.parquet");
+        assert_eq!(b.next_path(), "out/r1/batch-00001/part-w01-000001.parquet");
+        assert_eq!(a.next_path(), "out/r1/batch-00002/part-w00-000002.parquet");
     }
 
     #[tokio::test]
@@ -784,6 +830,79 @@ mod tests {
             vec![1500, 1500, 1500, 1500],
             "row groups must be split to exactly the limit, not overshoot"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Each run gets its own folder, and files fill numbered batch folders
+    /// to exactly the configured count across all writers.
+    #[tokio::test]
+    async fn groups_files_into_run_and_batch_folders() {
+        let dir = std::env::temp_dir().join(format!("dpsg-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, prefix) = build_store(&Destination::Local { directory: dir.clone() }).unwrap();
+
+        let tables = parse_schema("CREATE TABLE t (id BIGINT NOT NULL, note VARCHAR(64)) ENGINE=OLAP").unwrap();
+        let schema = BatchBuilder::new(tables[0].columns.clone(), 512).unwrap().schema();
+        let mut shared = (*settings(schema, Some(4096))).clone_for_test();
+        shared.run_id = "run-abc".to_string();
+        shared.files_per_folder = 3;
+        let shared = Arc::new(shared);
+        let stats = Arc::new(Stats::default());
+
+        // Two writers interleaving, each rolling several small files.
+        let mut sinks: Vec<ParquetSink> = (0..2)
+            .map(|id| ParquetSink::new(store.clone(), prefix.clone(), id, shared.clone(), stats.clone()))
+            .collect();
+        let mut builder = BatchBuilder::new(tables[0].columns.clone(), 512).unwrap();
+        for round in 0..4i64 {
+            for sink in sinks.iter_mut() {
+                for index in 0..500i64 {
+                    let row: Vec<(String, Value)> = vec![
+                        ("id".into(), Value::I64(round * 500 + index)),
+                        ("note".into(), Value::String(format!("value number {}", index))),
+                    ];
+                    builder
+                        .append_row(|name| row.iter().find(|(key, _)| key == name).map(|(_, v)| v))
+                        .unwrap();
+                }
+                sink.write(builder.finish().unwrap()).await.unwrap();
+            }
+        }
+        for sink in sinks {
+            sink.finish().await.unwrap();
+        }
+
+        // Only the run folder sits at the top level.
+        let top: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(top, vec!["run-abc".to_string()], "{:?}", top);
+
+        let mut folders: Vec<(String, usize)> = std::fs::read_dir(dir.join("run-abc"))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let files = std::fs::read_dir(entry.path())
+                    .unwrap()
+                    .filter(|file| {
+                        file.as_ref().unwrap().path().extension().is_some_and(|ext| ext == "parquet")
+                    })
+                    .count();
+                (entry.file_name().to_string_lossy().to_string(), files)
+            })
+            .collect();
+        folders.sort();
+        let total: usize = folders.iter().map(|(_, count)| count).sum();
+        assert_eq!(total as u64, stats.files_completed.load(Ordering::Relaxed));
+        assert!(folders.len() >= 2, "expected several batch folders: {:?}", folders);
+        assert_eq!(folders[0].0, "batch-00001");
+        // Every folder but the last is exactly full.
+        for (name, count) in &folders[..folders.len() - 1] {
+            assert_eq!(*count, 3, "{} should hold 3 files: {:?}", name, folders);
+        }
+        assert!(folders.last().unwrap().1 <= 3);
 
         std::fs::remove_dir_all(&dir).ok();
     }

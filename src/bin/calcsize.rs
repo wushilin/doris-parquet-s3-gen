@@ -14,8 +14,6 @@
 #[path = "../s3.rs"]
 mod s3;
 #[allow(dead_code)]
-#[path = "../units.rs"]
-mod units;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,7 +25,7 @@ use aws_sdk_s3::Client;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::Parser;
 
-use crate::units::{format_bytes, group_digits};
+use datagen::units::{format_bytes, group_digits};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -101,8 +99,8 @@ fn run_id_of(key: &str) -> String {
 }
 
 fn build_client(config: &s3::OutputConfig) -> Result<Client> {
-    let region = config
-        .s3
+    let s3 = config.s3()?;
+    let region = s3
         .region
         .clone()
         .unwrap_or_else(|| "us-east-1".to_string());
@@ -111,11 +109,11 @@ fn build_client(config: &s3::OutputConfig) -> Result<Client> {
         .region(Region::new(region))
         // Unlike object_store, the SDK puts the bucket in the host itself, so
         // the plain regional endpoint is what belongs here.
-        .force_path_style(config.s3.path_style);
-    if let Some(endpoint) = &config.s3.endpoint {
+        .force_path_style(s3.path_style);
+    if let Some(endpoint) = &s3.endpoint {
         builder = builder.endpoint_url(endpoint.trim_end_matches('/'));
     }
-    if let Some(credentials) = &config.s3.credentials {
+    if let Some(credentials) = &s3.credentials {
         builder = builder.credentials_provider(Credentials::new(
             credentials.access_key_id.clone(),
             credentials.secret_access_key.clone(),
@@ -236,12 +234,13 @@ async fn main() -> Result<()> {
 
     let config = s3::load(&args.config).with_context(|| {
         format!(
-            "failed to read S3 config `{}` (pass -c to point at another)",
+            "failed to read config `{}` (pass -c to point at another)",
             args.config.display()
         )
     })?;
     let client = build_client(&config)?;
-    let bucket = config.s3.bucket.clone();
+    let s3 = config.s3()?;
+    let bucket = s3.bucket.clone();
     let prefix = match &args.prefix {
         Some(given) => {
             let trimmed = given.trim().trim_start_matches('/');

@@ -1201,6 +1201,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "datagen"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "handlebars",
+ "precise_rate_limiter",
+ "rand 0.8.8",
+ "rquickjs",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1279,18 +1299,13 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
- "base64 0.22.1",
  "chrono",
  "clap",
- "csv",
+ "datagen",
  "futures",
- "handlebars",
  "object_store",
  "parquet",
- "precise_rate_limiter",
  "rand 0.8.8",
- "rquickjs",
- "rust_decimal",
  "serde",
  "serde_json",
  "serde_yaml",

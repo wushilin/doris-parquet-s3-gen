@@ -11,32 +11,101 @@ pub enum DorisType {
     SmallInt,
     Int,
     BigInt,
+    /// 128-bit integer, range ±(2^127 - 1).
     LargeInt,
     Float,
     Double,
+    /// Precision up to 38, or up to 76 when the cluster has
+    /// `enable_decimal256` turned on.
     Decimal { precision: u8, scale: u8 },
     Date,
     DateTime { scale: u8 },
+    /// Length in UTF-8 bytes, 1..=255.
     Char { len: u32 },
+    /// Length in UTF-8 bytes, 1..=65533.
     Varchar { len: u32 },
     String,
     Json,
     Variant,
-    /// Recognised but not generatable (HLL, BITMAP, QUANTILE_STATE, AGG_STATE).
-    Opaque(String),
-    /// Recognised container types. Not generatable yet.
+    Ipv4,
+    Ipv6,
     Array(Box<DorisType>),
     Map(Box<DorisType>, Box<DorisType>),
     Struct(Vec<(String, DorisType)>),
+    /// Sketch types have no Parquet form Doris loads directly. They are
+    /// written as their source values and built during the load with
+    /// `to_bitmap`, `hll_hash` or `to_quantile_state`.
+    Bitmap,
+    Hll,
+    QuantileState,
+    /// Carries the aggregate's signature, e.g. `sum(int)`. Not generatable:
+    /// its load expression depends on the function.
+    AggState(String),
 }
 
+/// DECIMAL precision above this needs Doris's `enable_decimal256`.
+pub const DECIMAL128_MAX_PRECISION: u8 = 38;
+pub const DECIMAL256_MAX_PRECISION: u8 = 76;
+
 impl DorisType {
-    /// Whether the generator layer can currently produce values for this type.
+    /// Whether the generator layer can produce values for this type.
     pub fn is_generatable(&self) -> bool {
-        !matches!(
-            self,
-            DorisType::Opaque(_) | DorisType::Array(_) | DorisType::Map(_, _) | DorisType::Struct(_)
-        )
+        match self {
+            DorisType::AggState(_) => false,
+            DorisType::Array(element) => element.is_generatable(),
+            DorisType::Map(key, value) => key.is_generatable() && value.is_generatable(),
+            DorisType::Struct(fields) => fields.iter().all(|(_, ty)| ty.is_generatable()),
+            _ => true,
+        }
+    }
+
+    /// The type as it would be written in Doris DDL, for messages.
+    pub fn sql_name(&self) -> String {
+        match self {
+            DorisType::Boolean => "BOOLEAN".into(),
+            DorisType::TinyInt => "TINYINT".into(),
+            DorisType::SmallInt => "SMALLINT".into(),
+            DorisType::Int => "INT".into(),
+            DorisType::BigInt => "BIGINT".into(),
+            DorisType::LargeInt => "LARGEINT".into(),
+            DorisType::Float => "FLOAT".into(),
+            DorisType::Double => "DOUBLE".into(),
+            DorisType::Decimal { precision, scale } => format!("DECIMAL({},{})", precision, scale),
+            DorisType::Date => "DATE".into(),
+            DorisType::DateTime { scale } => format!("DATETIME({})", scale),
+            DorisType::Char { len } => format!("CHAR({})", len),
+            DorisType::Varchar { len } => format!("VARCHAR({})", len),
+            DorisType::String => "STRING".into(),
+            DorisType::Json => "JSON".into(),
+            DorisType::Variant => "VARIANT".into(),
+            DorisType::Ipv4 => "IPV4".into(),
+            DorisType::Ipv6 => "IPV6".into(),
+            DorisType::Array(element) => format!("ARRAY<{}>", element.sql_name()),
+            DorisType::Map(key, value) => format!("MAP<{},{}>", key.sql_name(), value.sql_name()),
+            DorisType::Struct(fields) => format!(
+                "STRUCT<{}>",
+                fields
+                    .iter()
+                    .map(|(name, ty)| format!("{}:{}", name, ty.sql_name()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            DorisType::Bitmap => "BITMAP".into(),
+            DorisType::Hll => "HLL".into(),
+            DorisType::QuantileState => "QUANTILE_STATE".into(),
+            DorisType::AggState(signature) => format!("AGG_STATE<{}>", signature),
+        }
+    }
+
+    /// The Doris function a load must apply to turn the written source values
+    /// into this column's type, for sketch types only.
+    pub fn load_function(&self) -> Option<&'static str> {
+        match self {
+            DorisType::Bitmap => Some("to_bitmap"),
+            DorisType::Hll => Some("hll_hash"),
+            DorisType::QuantileState => Some("to_quantile_state"),
+            _ => None,
+        }
     }
 }
 
@@ -373,7 +442,7 @@ fn read_type_token(input: &str) -> (&str, usize) {
 }
 
 fn parse_type(text: &str) -> Result<DorisType> {
-    let text = text.trim();
+    let text = strip_nullability(text.trim());
     if text.is_empty() {
         bail!("missing type");
     }
@@ -414,11 +483,19 @@ fn parse_type(text: &str) -> Result<DorisType> {
         "LARGEINT" => DorisType::LargeInt,
         "FLOAT" | "REAL" => DorisType::Float,
         "DOUBLE" => DorisType::Double,
-        "DECIMAL" | "DECIMALV3" | "NUMERIC" => {
-            let precision = parse_arg(0, 9)?;
-            let scale = parse_arg(1, 0)?;
-            if precision == 0 || precision > 38 {
-                bail!("DECIMAL precision {} out of range 1..=38", precision);
+        "DECIMAL" | "DECIMALV3" | "DECIMALV2" | "NUMERIC" => {
+            // DECIMALV2 is the legacy type; without arguments it is (27, 9).
+            let (default_precision, default_scale) =
+                if upper == "DECIMALV2" { (27, 9) } else { (9, 0) };
+            let precision = parse_arg(0, default_precision)?;
+            let scale = parse_arg(1, default_scale)?;
+            if precision == 0 || precision > DECIMAL256_MAX_PRECISION as u32 {
+                bail!(
+                    "DECIMAL precision {} out of range 1..={} (above {} needs enable_decimal256)",
+                    precision,
+                    DECIMAL256_MAX_PRECISION,
+                    DECIMAL128_MAX_PRECISION
+                );
             }
             if scale > precision {
                 bail!("DECIMAL scale {} exceeds precision {}", scale, precision);
@@ -428,8 +505,8 @@ fn parse_type(text: &str) -> Result<DorisType> {
                 scale: scale as u8,
             }
         }
-        "DATE" | "DATEV2" => DorisType::Date,
-        "DATETIME" | "DATETIMEV2" => {
+        "DATE" | "DATEV2" | "DATEV1" => DorisType::Date,
+        "DATETIME" | "DATETIMEV2" | "DATETIMEV1" => {
             let scale = parse_arg(0, 0)?;
             if scale > 6 {
                 bail!("DATETIME scale {} out of range 0..=6", scale);
@@ -449,7 +526,12 @@ fn parse_type(text: &str) -> Result<DorisType> {
         "STRING" | "TEXT" => DorisType::String,
         "JSON" | "JSONB" => DorisType::Json,
         "VARIANT" => DorisType::Variant,
-        "HLL" | "BITMAP" | "QUANTILE_STATE" | "AGG_STATE" => DorisType::Opaque(upper),
+        "IPV4" => DorisType::Ipv4,
+        "IPV6" => DorisType::Ipv6,
+        "BITMAP" => DorisType::Bitmap,
+        "HLL" => DorisType::Hll,
+        "QUANTILE_STATE" => DorisType::QuantileState,
+        "AGG_STATE" => DorisType::AggState(String::new()),
         other => bail!("unsupported Doris type `{}`", other),
     };
     Ok(ty)
@@ -478,12 +560,56 @@ fn parse_container(name: &str, inner: &str) -> Result<DorisType> {
                 let (field, used) = read_ident(part)
                     .ok_or_else(|| anyhow!("cannot read STRUCT field name in `{}`", part))?;
                 let rest = part[used..].trim_start().trim_start_matches(':').trim_start();
+                // A field may end in COMMENT '...'; the type is what precedes it.
+                let rest = cut_at_top_level_keyword(rest, "COMMENT");
+                if fields.iter().any(|(existing, _): &(String, DorisType)| existing == &field) {
+                    bail!("STRUCT declares field `{}` twice", field);
+                }
                 fields.push((field, parse_type(rest)?));
+            }
+            if fields.is_empty() {
+                bail!("STRUCT needs at least one field");
             }
             Ok(DorisType::Struct(fields))
         }
+        "AGG_STATE" => Ok(DorisType::AggState(inner.trim().to_string())),
         other => bail!("unsupported Doris type `{}`", other),
     }
+}
+
+/// Drop a trailing `NULL` or `NOT NULL` from an element type such as the
+/// `INT NOT NULL` in `ARRAY<INT NOT NULL>`. Elements are always written as
+/// nullable Parquet fields, so the marker changes nothing about the output.
+fn strip_nullability(text: &str) -> &str {
+    let upper = text.to_ascii_uppercase();
+    for suffix in [" NOT NULL", " NULL"] {
+        if upper.ends_with(suffix) && !upper.ends_with('>') {
+            return text[..text.len() - suffix.len()].trim_end();
+        }
+    }
+    text
+}
+
+/// Everything before `keyword` when it appears outside brackets and quotes.
+fn cut_at_top_level_keyword<'a>(text: &'a str, keyword: &str) -> &'a str {
+    let blanked = strip_string_literals(text).to_ascii_uppercase();
+    let bytes = blanked.as_bytes();
+    let mut depth = 0usize;
+    for index in 0..bytes.len() {
+        match bytes[index] {
+            b'(' | b'<' => depth += 1,
+            b')' | b'>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && blanked[index..].starts_with(keyword) => {
+                let before_ok = index == 0 || !is_ident_byte(bytes[index - 1]);
+                let after = bytes.get(index + keyword.len()).copied();
+                if before_ok && after.is_none_or(|byte| !is_ident_byte(byte)) {
+                    return text[..index].trim_end();
+                }
+            }
+            _ => {}
+        }
+    }
+    text
 }
 
 /// Blank out quoted literals so keyword scanning cannot match inside a COMMENT.
@@ -720,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_container_types_and_marks_them_ungeneratable() {
+    fn parses_container_and_sketch_types() {
         let columns = columns_of(
             "CREATE TABLE t (a ARRAY<INT>, b MAP<STRING, BIGINT>, c STRUCT<x:INT, y:STRING>, d HLL) ENGINE=OLAP",
         );
@@ -736,11 +862,12 @@ mod tests {
                 ("y".to_string(), DorisType::String),
             ])
         );
-        assert_eq!(columns[3].ty, DorisType::Opaque("HLL".to_string()));
+        assert_eq!(columns[3].ty, DorisType::Hll);
+        // Containers and sketches are generatable; only AGG_STATE is not.
         for column in &columns {
-            assert!(!column.ty.is_generatable(), "{} should not be generatable", column.name);
+            assert!(column.ty.is_generatable(), "{} should be generatable", column.name);
         }
-        assert!(DorisType::Int.is_generatable());
+        assert!(!DorisType::AggState("sum(int)".into()).is_generatable());
     }
 
     #[test]
@@ -786,5 +913,56 @@ mod tests {
     fn handles_external_table_and_trailing_semicolons() {
         let tables = parse_schema("CREATE EXTERNAL TABLE ext (a INT);").expect("parse");
         assert_eq!(tables[0].name, "ext");
+    }
+
+    #[test]
+    fn parses_every_doris_column_type() {
+        let columns = columns_of(
+            "CREATE TABLE t (
+                a IPV4, b IPV6,
+                c DECIMAL(76, 10), d DECIMALV2, e DATEV1, f DATETIMEV1,
+                g BITMAP, h HLL, i QUANTILE_STATE, j AGG_STATE<sum(int)>,
+                k STRUCT<city:VARCHAR(32) COMMENT 'where, exactly', zip:INT COMMENT \"code\">,
+                l ARRAY<INT NOT NULL>,
+                m ARRAY<MAP<STRING, ARRAY<DECIMAL(10,2)>>>,
+                n MAP<INT, STRUCT<x:DATETIME(3), y:LARGEINT>>
+            ) ENGINE=OLAP",
+        );
+        let ty = |index: usize| columns[index].ty.clone();
+        assert_eq!(ty(0), DorisType::Ipv4);
+        assert_eq!(ty(1), DorisType::Ipv6);
+        assert_eq!(ty(2), DorisType::Decimal { precision: 76, scale: 10 });
+        assert_eq!(ty(3), DorisType::Decimal { precision: 27, scale: 9 });
+        assert_eq!(ty(4), DorisType::Date);
+        assert_eq!(ty(5), DorisType::DateTime { scale: 0 });
+        assert_eq!(ty(6), DorisType::Bitmap);
+        assert_eq!(ty(7), DorisType::Hll);
+        assert_eq!(ty(8), DorisType::QuantileState);
+        assert_eq!(ty(9), DorisType::AggState("sum(int)".into()));
+        assert_eq!(
+            ty(10),
+            DorisType::Struct(vec![
+                ("city".into(), DorisType::Varchar { len: 32 }),
+                ("zip".into(), DorisType::Int),
+            ])
+        );
+        assert_eq!(ty(11), DorisType::Array(Box::new(DorisType::Int)));
+        assert_eq!(
+            ty(12).sql_name(),
+            "ARRAY<MAP<STRING,ARRAY<DECIMAL(10,2)>>>"
+        );
+        assert_eq!(
+            ty(13).sql_name(),
+            "MAP<INT,STRUCT<x:DATETIME(3),y:LARGEINT>>"
+        );
+        assert_eq!(DorisType::Bitmap.load_function(), Some("to_bitmap"));
+        assert_eq!(DorisType::Int.load_function(), None);
+    }
+
+    #[test]
+    fn rejects_malformed_new_types() {
+        assert!(parse_schema("CREATE TABLE t (a DECIMAL(77, 2)) ENGINE=OLAP").is_err());
+        assert!(parse_schema("CREATE TABLE t (a STRUCT<x:INT, x:INT>) ENGINE=OLAP").is_err());
+        assert!(parse_schema("CREATE TABLE t (a MAP<INT>) ENGINE=OLAP").is_err());
     }
 }
