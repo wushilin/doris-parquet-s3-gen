@@ -5,14 +5,14 @@ directory, as typed Parquet. Nothing is staged on disk and no whole file is
 held in memory; each object is streamed out as a multipart upload and appears
 atomically when it completes.
 
-Row generation comes from the [`datagen`](../datagen) framework. This tool
+Row generation comes from the [`datagen`](vendor/datagen) framework. This tool
 adds the Doris schema, the type mapping, the Parquet writer and the upload
 pipeline.
 
 ## Running it
 
 ```sh
-cargo build --release          # needs ../datagen checked out alongside
+cargo build --release          # datagen is vendored under vendor/datagen
 
 # 1. an editable field spec, one entry per column, from your DDL
 ./target/release/doris-parquet-s3-gen --schema schema.sql --emit-spec spec.yaml
@@ -105,7 +105,7 @@ or a stream load, use the `datagen` console tool it builds on.
 ## How it works
 
 The Doris DDL supplies column types, order and nullability. The spec supplies
-the generator for each column, and the [`datagen`](../datagen) framework
+the generator for each column, and the [`datagen`](vendor/datagen) framework
 generates the rows: this tool adds the Doris schema, the type mapping, the
 Parquet writer and the upload pipeline. See [Types](#types) for how every Doris type is
 written to Parquet.
