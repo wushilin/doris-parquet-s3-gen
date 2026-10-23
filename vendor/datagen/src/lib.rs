@@ -616,6 +616,53 @@ fields:
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn javascript_keeps_working_after_moving_to_another_thread() {
+        // A producer is a tokio task, so it resumes on any worker thread after an await. The
+        // runtime it built on one thread must keep working on the next.
+        let dir = temp_dir("jsmove");
+        let script = dir.join("one.js");
+        std::fs::write(&script, "function one() { return 1; }").unwrap();
+        let spec = compile_yaml(&format!(
+            "version: 1\nfields:\n  - name: v\n    gen:\n      type: javascript\n      \
+             file: \"{}\"\n      function: one\n      parallel: true\n",
+            script.display()
+        ))
+        .unwrap();
+        let field = std::sync::Mutex::new((*spec.fields)[0].clone());
+        let generate = || {
+            let mut rng = StdRng::seed_from_u64(3);
+            field
+                .lock()
+                .unwrap()
+                .generator
+                .generate(&RowContext::new(), &mut rng)
+                .map(|value| value.csv_string(""))
+                .map_err(|error| format!("{:#}", error))
+        };
+        const HOPS: usize = 4;
+        // Every thread stays alive until all have run, so no two share a stack.
+        let all_ran = std::sync::Barrier::new(HOPS);
+        let mut results = Vec::new();
+        std::thread::scope(|scope| {
+            for _ in 0..HOPS {
+                let (done, result) = std::sync::mpsc::channel();
+                let (generate, all_ran) = (&generate, &all_ran);
+                scope.spawn(move || {
+                    done.send(generate()).unwrap();
+                    all_ran.wait();
+                });
+                // One at a time: the first call builds the runtime, the rest reuse it.
+                results.push(result.recv().unwrap());
+            }
+        });
+        // Asserting inside the scope would leave the barrier waiting for threads never spawned.
+        for (hop, result) in results.into_iter().enumerate() {
+            assert_eq!(result, Ok("1".to_string()), "on thread {}", hop);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Generate a fluctuating series as numbers.
     fn fluctuating_series(extra: &str, rows: usize) -> Vec<f64> {
         let yaml = format!(
